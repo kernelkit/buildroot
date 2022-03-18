@@ -1,3 +1,4 @@
 # Locally calculated
-sha256  bfab74a625d65238c569b9df282b55c0fc9a1e2d3decedcf194d44774df2ede4  mv-ddr-marvell-305d923e6bc4236cd3b902f6679b0aef9e5fa52d.tar.gz
+#sha256  bfab74a625d65238c569b9df282b55c0fc9a1e2d3decedcf194d44774df2ede4  mv-ddr-marvell-305d923e6bc4236cd3b902f6679b0aef9e5fa52d.tar.gz
+sha256  4809058ea6f2f129c20828aad8680911864a8512fcdeb09ce091c15d1f0c75dd  mv-ddr-marvell-7753d4b3e42036d44bf3d5b68109f0c7d7aadbcc.tar.gz
 sha256  48bb930b6fbc3f5db72e29c849b096df3868e4a6d2bdc0e2dd3365c768241cd5  ddr3_init.c
