@@ -21,6 +21,13 @@ config BR2_PACKAGE_SYSREPO_EXAMPLES
 	help
 	  Enable sysrepo examples.
 
+config BR2_PACKAGE_SYSREPO_INTERNAL_DATA
+	string "Path to xml/json config for internal modules."
+	help
+	  Optional path to a file with startup and factory-default data
+	  of internal modules.  Contents of the file are compiled into
+	  the library.  Example: ietf-netconf-acm defaults.
+
 endif
 
 comment "sysrepo needs a toolchain w/ C++, NPTL, dynamic library, gcc >= 4.8"
