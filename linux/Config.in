@@ -419,6 +419,15 @@ config BR2_LINUX_KERNEL_CUSTOM_DTS_PATH
 	  will be copied to the kernel sources and the .dts files will
 	  be compiled from there.
 
+config BR2_LINUX_KERNEL_CUSTOM_DTS_OVERLAY
+	string "Out-of-tree Device Tree Source overlay paths"
+	help
+	  A list of overlay directories that are copied to the
+	  applicable boot/dts directory.
+
+	  Use this in concert with BR2_LINUX_KERNEL_INTREE_DTS_NAME to
+	  select DTBs to be built.
+
 config BR2_LINUX_KERNEL_DTB_KEEP_DIRNAME
 	bool "Keep the directory name of the Device Tree"
 	help
