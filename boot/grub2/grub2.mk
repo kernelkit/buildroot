@@ -15,6 +15,12 @@ HOST_GRUB2_DEPENDENCIES = host-bison host-flex host-gawk \
 	$(BR2_PYTHON3_HOST_DEPENDENCY)
 GRUB2_INSTALL_IMAGES = YES
 
+# Required due to patch that we adds a patch to achieve search for uuid
+define GRUB2_RUN_AUTOGEN
+        cd $(@D) && ./autogen.sh
+endef
+GRUB2_PRE_CONFIGURE_HOOKS += GRUB2_RUN_AUTOGEN
+
 # CVE-2019-14865 is about a flaw in the grub2-set-bootflag tool, which
 # doesn't exist upstream, but is added by the Redhat/Fedora
 # packaging. Not applicable to Buildroot.
