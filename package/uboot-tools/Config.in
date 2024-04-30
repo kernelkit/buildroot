@@ -68,6 +68,8 @@ config BR2_PACKAGE_UBOOT_TOOLS_MKIMAGE
 
 config BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE
 	bool "mkeficapsule"
+	depends on BR2_PACKAGE_UTIL_LINUX_LIBUUID
+	depends on BR2_PACKAGE_GNUTLS
 	help
 	  Install the mkeficapsule tool on the target system
 
@@ -100,5 +102,12 @@ config BR2_PACKAGE_UBOOT_TOOLS_DUMPIMAGE
 
 	  The dumpimage tool from Das U-Boot bootloader, which allows
 	  extraction of data from U-Boot images.
+
+config BR2_PACKAGE_UBOOT_TOOLS_FDT_ADD_PUBKEY
+	bool "fdt_add_key"
+	help
+	  Install the fdt_add_key tool on the target system
+
+	  The fdt_add_pubkey is used to add a public key to the fdt.
 
 endif
