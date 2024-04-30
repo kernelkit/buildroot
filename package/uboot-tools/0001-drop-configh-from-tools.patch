@@ -44,6 +44,26 @@ index 86be16d..3c62ac4 100644
  /*
   * To build the utility with the static configuration
   * comment out the next line.
+diff --git a/tools/printinitialenv.c b/tools/printinitialenv.c
+index c58b234d..73266680 100644
+--- a/tools/printinitialenv.c
++++ b/tools/printinitialenv.c
+@@ -15,14 +15,6 @@
+ /* Pull in the current config to define the default environment */
+ #include <linux/kconfig.h>
+ 
+-#ifndef __ASSEMBLY__
+-#define __ASSEMBLY__ /* get only #defines from config.h */
+-#include <config.h>
+-#undef	__ASSEMBLY__
+-#else
+-#include <config.h>
+-#endif
+-
+ #define DEFAULT_ENV_INSTANCE_STATIC
+ #include <generated/environment.h>
+ #include <env_default.h>
+
 -- 
 2.9.4
 
