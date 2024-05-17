@@ -10,6 +10,9 @@ NETOPEER2_LICENSE = BSD-3-Clause
 NETOPEER2_LICENSE_FILES = LICENSE
 NETOPEER2_DEPENDENCIES = libnetconf2 libyang sysrepo host-sysrepo
 
+ifeq ($(BR_PACKAGE_LINUX_PAM),y)
+NETOPEER2_DEPENDENCIES += linux-pam
+endif
 ifeq ($(BR2_INIT_SYSTEMD),y)
 NETOPEER2_DEPENDENCIES += systemd
 endif
