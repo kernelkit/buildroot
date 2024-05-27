@@ -15,7 +15,7 @@ LINUX_PAM_CONF_OPTS = \
 	--disable-db \
 	--disable-regenerate-docu \
 	--enable-securedir=/lib/security \
-	--libdir=/lib
+	--libdir=/usr/lib
 LINUX_PAM_DEPENDENCIES = flex host-flex host-pkgconf \
 	$(if $(BR2_PACKAGE_LIBXCRYPT),libxcrypt) \
 	$(TARGET_NLS_DEPENDENCIES)
