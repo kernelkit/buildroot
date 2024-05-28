@@ -4,6 +4,11 @@ config BR2_PACKAGE_LIBNETCONF2
 	depends on BR2_TOOLCHAIN_HAS_THREADS
 	depends on !BR2_STATIC_LIBS
 	depends on BR2_USE_MMU
+	select BR2_PACKAGE_LIBSSH
+	select BR2_PACKAGE_LIBSSH_SERVER   # For SSH
+	select BR2_PACKAGE_LIBOPENSSL      # For TLS
+	select BR2_PACKAGE_LIBCURL         # For TLS
+	select BR2_PACKAGE_LIBCURL_OPENSSL # For TLS
 	select BR2_PACKAGE_LIBYANG
 	help
 	  libnetconf2 is a NETCONF library in C intended for building
