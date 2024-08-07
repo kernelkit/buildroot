@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-UBOOT_TOOLS_VERSION = 2024.04
+UBOOT_TOOLS_VERSION = 2021.07
 UBOOT_TOOLS_SOURCE = u-boot-$(UBOOT_TOOLS_VERSION).tar.bz2
 UBOOT_TOOLS_SITE = https://ftp.denx.de/pub/u-boot
 UBOOT_TOOLS_LICENSE = GPL-2.0+
@@ -17,60 +17,35 @@ UBOOT_TOOLS_INSTALL_STAGING = YES
 UBOOT_TOOLS_DEPENDENCIES = $(BR2_MAKE_HOST_DEPENDENCY)
 HOST_UBOOT_TOOLS_DEPENDENCIES = $(BR2_MAKE_HOST_DEPENDENCY)
 
-
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FIT_SUPPORT),y)
-UBOOT_TOOLS_DEPENDENCIES += dtc
-endif
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT),y)
-UBOOT_TOOLS_DEPENDENCIES += openssl host-pkgconf
-endif
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE),y)
-HOST_UBOOT_TOOLS_DEPENDENCIES=gnutls util-linyx
-endif
+define UBOOT_TOOLS_CONFIGURE_CMDS
+	mkdir -p $(@D)/include/config
+	touch $(@D)/include/config/auto.conf
+	mkdir -p $(@D)/include/generated
+	touch $(@D)/include/generated/autoconf.h
+	echo $(if $(BR2_PACKAGE_UBOOT_TOOLS_FIT_SUPPORT),'#define CONFIG_FIT_PRINT 1') >> $(@D)/include/generated/autoconf.h
+	mkdir -p $(@D)/include/asm
+	touch $(@D)/include/asm/linkage.h
+endef
 
 UBOOT_TOOLS_MAKE_OPTS = CROSS_COMPILE="$(TARGET_CROSS)" \
-	CFLAGS="$(TARGET_CFLAGS)"			\
-	LDFLAGS="$(TARGET_LDFLAGS)"			\
-	HOSTCFLAGS="$(HOST_CFLAGS)"			\
-	STRIP=$(TARGET_STRIP)				\
-	$(BR2_PATH)
+	CFLAGS="$(TARGET_CFLAGS)" \
+	LDFLAGS="$(TARGET_LDFLAGS)" \
+	HOSTCFLAGS="$(HOST_CFLAGS)" \
+	STRIP=$(TARGET_STRIP)
 
+ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FIT_SUPPORT),y)
+UBOOT_TOOLS_MAKE_OPTS += CONFIG_FIT=y CONFIG_MKIMAGE_DTC_PATH=dtc
+UBOOT_TOOLS_DEPENDENCIES += dtc
+endif
 
-define UBOOT_TOOLS_PRE_CONFIGURE_INIT
-	cd $(@D) && make tools-only_defconfig
-endef
+ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT),y)
+UBOOT_TOOLS_MAKE_OPTS += CONFIG_FIT_SIGNATURE=y CONFIG_FIT_SIGNATURE_MAX_SIZE=0x10000000
+UBOOT_TOOLS_DEPENDENCIES += openssl host-pkgconf
+endif
 
-UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_PRE_CONFIGURE_INIT
-
-define UBOOT_TOOLS_CONFIGURE_FIT_SUPPORT
-if [ "$(BR2_PACKAGE_UBOOT_TOOLS_FIT_SUPPORT)" == "y" ]; then \
-	BR2_PREFIX="" ./utils/config --file $(@D)/.config --enable CONFIG_FIT; \
-else \
-	BR2_PREFIX="" ./utils/config --file $(@D)/.config --disable CONFIG_FIT; \
-fi
-endef
-UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_FIT_SUPPORT
-
-define UBOOT_TOOLS_CONFIGURE_FIT_SIGNATURE_SUPPORT
-if [ "$(BR2_PACKAGE_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT)" == "y" ]; then   \
-BR2_PREFIX="" ./utils/config --file $(@D)/.config --enable CONFIG_FIT_SIGNATURE; \
-BR2_PREFIX="" ./utils/config --file $(@D)/.config --set-str CONFIG_TOOLS_FIT_SIGNATURE_MAX_SIZE "0x10000000"; \
-else \
-	BR2_PREFIX="" ./utils/config --file $(@D)/.config --disable CONFIG_FIT_SIGNATURE; \
-fi
-endef
-UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_FIT_SIGNATURE_SUPPORT
-
-define UBOOT_TOOLS_CONFIGURE_MKEFICAPSULE
-if [ "$(BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE)" = "y" ]; then \
-	BR2_PREFIX="" ./utils/config --file $(@D)/.config --enable CONFIG_TOOLS_MKEFICAPSULE;  \
-else \
-	BR2_PREFIX="" ./utils/config --file $(@D)/.config --disable CONFIG_TOOLS_MKEFICAPSULE;  \
-fi
-endef
-UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_MKEFICAPSULE
-
-# Install
+ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE),y)
+UBOOT_TOOLS_MAKE_OPTS += CONFIG_EFI_HAVE_CAPSULE_SUPPORT=y
+endif
 
 ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FIT_CHECK_SIGN),y)
 define UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN
@@ -115,11 +90,6 @@ define UBOOT_TOOLS_INSTALL_DUMPIMAGE
 	$(INSTALL) -m 0755 -D $(@D)/tools/dumpimage $(TARGET_DIR)/usr/sbin/dumpimage
 endef
 endif
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FDT_ADD_PUBKEY),y)
-define UBOOT_INSTALL_UBOOT_TOOLS_FDT_ADD_PUBKEY
-	$(INSTALL) -m 0755 -D $(@D)/tools/fdt_add_pubkey $(TARGET_DIR)/usr/bin/fdt_add_pubkey
-endef
-endif
 
 define UBOOT_TOOLS_INSTALL_STAGING_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/tools/env/lib.a $(STAGING_DIR)/usr/lib/libubootenv.a
@@ -133,33 +103,37 @@ define UBOOT_TOOLS_INSTALL_TARGET_CMDS
 	$(UBOOT_TOOLS_INSTALL_FWPRINTENV)
 	$(UBOOT_TOOLS_INSTALL_DUMPIMAGE)
 	$(UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN)
-	$(UBOOT_INSTALL_UBOOT_TOOLS_FDT_ADD_PUBKEY)
 endef
 
 # host-uboot-tools
-define HOST_UBOOT_TOOLS_PRE_CONFIGURE_INIT
-	cd $(@D) && make tools-only_defconfig
+
+define HOST_UBOOT_TOOLS_CONFIGURE_CMDS
+	mkdir -p $(@D)/include/config
+	touch $(@D)/include/config/auto.conf
+	mkdir -p $(@D)/include/generated
+	touch $(@D)/include/generated/autoconf.h
+	echo $(if $(BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT),'#define CONFIG_FIT_PRINT 1') >> $(@D)/include/generated/autoconf.h
+	mkdir -p $(@D)/include/asm
+	touch $(@D)/include/asm/linkage.h
 endef
 
-HOST_UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_PRE_CONFIGURE_INIT
-HOST_UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_FIT_SUPPORT
-HOST_UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_FIT_SIGNATURE_SUPPORT
-HOST_UBOOT_TOOLS_PRE_CONFIGURE_HOOKS += UBOOT_TOOLS_CONFIGURE_MKEFICAPSULE
-
 HOST_UBOOT_TOOLS_MAKE_OPTS = HOSTCC="$(HOSTCC)" \
-	HOSTCFLAGS="$(HOST_CFLAGS)" 		\
-	HOSTLDFLAGS="$(HOST_LDFLAGS)"
+	HOSTCFLAGS="$(HOST_CFLAGS)" \
+	HOSTLDFLAGS="$(HOST_LDFLAGS)" \
+	CONFIG_EFI_HAVE_CAPSULE_SUPPORT=y
 
-
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE),y)
-HOST_UBOOT_TOOLS_DEPENDENCIES=host-gnutls host-util-linyx
+ifeq ($(BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT),y)
+HOST_UBOOT_TOOLS_MAKE_OPTS += CONFIG_FIT=y CONFIG_MKIMAGE_DTC_PATH=dtc
+HOST_UBOOT_TOOLS_DEPENDENCIES += host-dtc
 endif
+
 ifeq ($(BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT),y)
+HOST_UBOOT_TOOLS_MAKE_OPTS += CONFIG_FIT_SIGNATURE=y CONFIG_FIT_SIGNATURE_MAX_SIZE=0x10000000
 HOST_UBOOT_TOOLS_DEPENDENCIES += host-openssl
 define HOST_UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN
 	$(INSTALL) -m 0755 -D $(@D)/tools/fit_check_sign $(HOST_DIR)/bin/fit_check_sign
 endef
-endif # BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT
+endif
 
 ifeq ($(BR2_PACKAGE_HOST_UBOOT_TOOLS_ENVIMAGE),y)
 
@@ -180,6 +154,7 @@ HOST_UBOOT_TOOLS_DEPENDENCIES += uboot
 ifeq ($(UBOOT_TOOLS_GENERATE_ENV_FILE),)
 UBOOT_TOOLS_GENERATE_ENV_FILE = $(@D)/boot-env-defaults.txt
 define HOST_UBOOT_TOOLS_GENERATE_ENV_DEFAULTS
+	CROSS_COMPILE="$(TARGET_CROSS)" \
 		$(UBOOT_SRCDIR)/scripts/get_default_envs.sh \
 		$(UBOOT_SRCDIR) \
 		> $(UBOOT_TOOLS_GENERATE_ENV_FILE)
@@ -240,12 +215,9 @@ endef
 
 define HOST_UBOOT_TOOLS_INSTALL_CMDS
 	$(INSTALL) -m 0755 -D $(@D)/tools/mkimage $(HOST_DIR)/bin/mkimage
-if [ "$(BR2_PACKAGE_UBOOT_TOOLS_MKEFICAPSULE)" = "y" ]; then \
-	$(INSTALL) -m 0755 -D $(@D)/tools/mkeficapsule $(HOST_DIR)/bin/mkeficapsule; \
-fi
+	$(INSTALL) -m 0755 -D $(@D)/tools/mkeficapsule $(HOST_DIR)/bin/mkeficapsule
 	$(INSTALL) -m 0755 -D $(@D)/tools/mkenvimage $(HOST_DIR)/bin/mkenvimage
 	$(INSTALL) -m 0755 -D $(@D)/tools/dumpimage $(HOST_DIR)/bin/dumpimage
-	$(INSTALL) -m 0755 -D $(@D)/tools/fdt_add_pubkey $(HOST_DIR)/bin/fdt_add_pubkey
 	$(HOST_UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN)
 	$(INSTALL) -m 0755 -D $(@D)/tools/env/fw_printenv $(HOST_DIR)/bin/fw_printenv
 	ln -sf $(HOST_DIR)/bin/fw_printenv $(HOST_DIR)/bin/fw_setenv
