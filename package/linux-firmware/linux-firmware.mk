@@ -885,6 +885,14 @@ LINUX_FIRMWARE_FILES += v4l-cx23885-avcore-01.fw
 # which is installed unconditionally
 endif
 
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_EIP197),y)
+LINUX_FIRMWARE_FILES += \
+	inside-secure/eip197_minifw/ifpp.bin \
+	inside-secure/eip197_minifw/ipue.bin
+# No license file; the license is in the file WHENCE
+# which is installed unconditionally
+endif
+
 ifneq ($(LINUX_FIRMWARE_FILES)$(LINUX_FIRMWARE_DIRS),)
 
 define LINUX_FIRMWARE_BUILD_CMDS

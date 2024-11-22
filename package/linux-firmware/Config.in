@@ -675,4 +675,14 @@ config BR2_PACKAGE_LINUX_FIRMWARE_CX23885
 
 endmenu
 
+menu "Crypto Firmware"
+
+config BR2_PACKAGE_LINUX_FIRMWARE_EIP197
+	bool "SafeXcel EIP-97 and EIP-197 crypto engine"
+	help
+	  Firmware files for SafeXcel EIP-97 and EIP-197 crypto
+	  engines, needed by the Linux crypto_safexcel driver.
+
+endmenu
+
 endif
