@@ -287,6 +287,15 @@ NGINX_DEPENDENCIES += nginx-modsecurity
 NGINX_CONF_OPTS += --add-module=$(NGINX_MODSECURITY_DIR)
 endif
 
+ifeq ($(BR2_PACKAGE_NGINX_LUA_MODULE),y)
+NGINX_DEPENDENCIES += nginx-lua-module
+NGINX_CONF_OPTS += --add-module=$(NGINX_LUA_MODULE_DIR)
+ifeq ($(BR2_PACKAGE_LUAJIT),y)
+NGINX_CONF_ENV += LUAJIT_LIB=$(STAGING_DIR)/usr/lib
+LUAJIT_INC=$(STAGING_DIR)/usr/include
+endif
+endif
+
 # Debug logging
 NGINX_CONF_OPTS += $(if $(BR2_PACKAGE_NGINX_DEBUG),--with-debug)
 
