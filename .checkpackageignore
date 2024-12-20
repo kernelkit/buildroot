@@ -131,12 +131,11 @@ package/am33x-cm3/0004-Makefile-add-fno-builtin.patch Upstream
 package/am33x-cm3/S93-am335x-pm-firmware-load Variables
 package/android-tools/0001-Fix-makefiles-for-out-of-tree-build.patch Upstream
 package/android-tools/0002-Fix-adbd-for-non-Ubuntu-systems.patch Upstream
-package/android-tools/0003-Fix-build-issue-with-uclibc.patch Upstream
 package/android-tools/0004-Fix-build-issue-with-musl.patch Upstream
-package/android-tools/0005-Use-pkgconf-to-get-libs-deps.patch Upstream
-package/android-tools/0006-fix-big-endian-build.patch Upstream
-package/android-tools/0007-include-cdefs-h-when-needed.patch Upstream
-package/android-tools/0008-Include-sysmacros.h-to-compile-with-glibc-2.28.patch Sob Upstream
+package/android-tools/0005-makefiles-use-pkgconf-to-get-libs-deps.patch Upstream
+package/android-tools/0006-Fix-build-on-big-endian-systems.patch Upstream
+package/android-tools/0007-Include-cdefs.h-wherever-it-is-needed.patch Upstream
+package/android-tools/0008-usb_linux.c-fix-minor-major-build-failure-due-to-gli.patch Upstream
 package/android-tools/0009-Fix-makefiles-for-out-of-tree-ext4_utils-build.patch Upstream
 package/android-tools/0010-adb-added-patch-for-openssl-1.1.0-compatibility.patch Upstream
 package/aoetools/0001-Change-shell-script-interpreter-from-bin-bash-to-bin.patch Upstream
@@ -329,8 +328,6 @@ package/dvdrw-tools/0002-Include-sysmacros.h-to-compile-with-newer-gcc.patch Ups
 package/earlyoom/0001-main.c-fix-build-with-kernel-4.3.patch Upstream
 package/earlyoom/S02earlyoom Indent Shellcheck
 package/ebtables/0001-replace-ebtables-save-perl-script-with-bash.patch Upstream
-package/ebtables/0002-ebtables.h-restore-KERNEL_64_USERSPACE_32-checks.patch Upstream
-package/ebtables/0003-configure.ac-add-option-enable-kernel-64-userland-32.patch Upstream
 package/ecryptfs-utils/0001-musl.patch Upstream
 package/ecryptfs-utils/0002-openssl110.patch Upstream
 package/ecryptfs-utils/0003-fix-parallel-build-issue.patch Upstream
@@ -1377,8 +1374,6 @@ package/x11r7/xdriver_xf86-video-nouveau/0001-nouveau-fixup-driver-for-new-X-ser
 package/x11r7/xdriver_xf86-video-tdfx/0001-cross.patch Sob Upstream
 package/x11r7/xserver_xorg-server/0001-include-misc.h-fix-uClibc-build.patch Upstream
 package/x11r7/xserver_xorg-server/S40xorg Shellcheck Variables
-package/x11vnc/0001-Fix-build-on-32bit-arches-with-64bit-time_t.patch Upstream
-package/x11vnc/0002-scan-limit-access-to-shared-memory-segments-to-current-user.patch Upstream
 package/xen/0001-9pfs-include-linux-limits.h-for-XATTR_SIZE_MAX.patch Upstream
 package/xen/0002-Fix-build-with-64-bits-time_t.patch Upstream
 package/xen/0003-libs-light-fix-tv_sec-printf-format.patch Upstream
