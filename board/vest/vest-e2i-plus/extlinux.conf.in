@@ -1,0 +1,4 @@
+label buildroot
+  kernel /boot/Image
+  devicetree /boot/freescale/imx8mp-vest-e2i-plus.dtb
+  append root=PARTUUID=%PARTUUID% rootwait rw
