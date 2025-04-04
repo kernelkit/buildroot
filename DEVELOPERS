@@ -1628,7 +1628,9 @@ F:	package/rtty/
 
 N:	Joachim Wiberg <troglobit@gmail.com>
 F:	configs/globalscale_espressobin_defconfig
+F:	configs/vest-e2i-plus_defconfig
 F:	board/globalscale/espressobin/
+F:	board/vest/vest-e2i-plus/
 F:	package/inadyn/
 F:	package/libconfuse/
 F:	package/libite/
