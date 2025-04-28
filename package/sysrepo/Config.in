@@ -30,6 +30,13 @@ config BR2_PACKAGE_SYSREPO_INTERNAL_DATA
 
 endif
 
+config BR2_PACKAGE_SYSREPO_GROUP
+    string "System group for Sysrepo files"
+    help
+      Specifies the system group that will own Sysrepo files and directories.
+      This sets the SYSREPO_GROUP CMake option. Use a dedicated group (e.g., 'sysrepo')
+      and combine with a restrictive umask to control access.
+
 comment "sysrepo needs a toolchain w/ C++, NPTL, dynamic library, gcc >= 4.8"
 	depends on BR2_USE_MMU
 	depends on BR2_TOOLCHAIN_HAS_SYNC_4
