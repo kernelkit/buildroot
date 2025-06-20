@@ -71,7 +71,6 @@ config BR2_PACKAGE_RPI_FIRMWARE_CONFIG_FILE
 
 config BR2_PACKAGE_RPI_FIRMWARE_CMDLINE_FILE
 	string "Path to a file stored as boot/cmdline.txt"
-	default "board/raspberrypi/cmdline.txt"  # legacy
 	help
 	  Path to a file stored as cmdline.txt in the boot partition
 	  of the generated SD card image.
