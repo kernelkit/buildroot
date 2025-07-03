@@ -260,6 +260,10 @@ UBOOT_BINS += u-boot.ldr
 UBOOT_DEPENDENCIES += host-adsp-ldr
 endif
 
+ifeq ($(BR2_TARGET_UBOOT_NEEDS_UBOOT_TOOLS),y)
+UBOOT_DEPENDENCIES += host-uboot-tools
+endif
+
 ifeq ($(BR2_TARGET_UBOOT_NEEDS_DTC),y)
 UBOOT_DEPENDENCIES += host-dtc
 UBOOT_MAKE_OPTS += DTC=$(HOST_DIR)/bin/dtc
