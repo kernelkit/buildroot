@@ -172,6 +172,13 @@ config BR2_TARGET_UBOOT_DEFAULT_ENV_FILE
 
 	  Requires U-Boot >= v2018.05.
 
+config BR2_TARGET_UBOOT_NEEDS_UBOOT_TOOLS
+	bool "U-Boot needs uboot-tools"
+	select BR2_PACKAGE_HOST_UBOOT_TOOLS
+	help
+	  Select this option if your U-Boot board configuration
+	  requires the uboot tools package
+
 config BR2_TARGET_UBOOT_NEEDS_DTC
 	bool "U-Boot needs dtc"
 	select BR2_PACKAGE_HOST_DTC
