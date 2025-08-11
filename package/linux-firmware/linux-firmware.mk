@@ -353,6 +353,21 @@ LINUX_FIRMWARE_FILES += mrvl/pcieusb8997_combo_v4.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.Marvell
 endif
 
+# MT7986
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7986),y)
+LINUX_FIRMWARE_FILES += mediatek/mt7986_eeprom_mt7975_dual.bin \
+			mediatek/mt7986_eeprom_mt7976.bin \
+			mediatek/mt7986_eeprom_mt7976_dbdc.bin \
+			mediatek/mt7986_eeprom_mt7976_dual.bin \
+			mediatek/mt7986_rom_patch.bin \
+			mediatek/mt7986_rom_patch_mt7975.bin \
+			mediatek/mt7986_wa.bin \
+			mediatek/mt7986_wm.bin \
+			mediatek/mt7986_wm_mt7975.bin \
+			mediatek/mt7986_wo_0.bin \
+			mediatek/mt7986_wo_1.bin
+LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
+endif
 # MT7601
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7601U),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7601u.bin

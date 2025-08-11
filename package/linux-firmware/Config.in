@@ -424,6 +424,11 @@ config BR2_PACKAGE_LINUX_FIRMWARE_MWIFIEX_PCIEUSB8997
 	  Firmware files for the Marvell Wifi-Ex 8997 module on
 	  PCI-E/USB.
 
+config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7986
+       bool "MediaTek MT7986 SOC WiFi"
+       help
+	MediaTek MT7986 SOC WiFi
+
 config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7601U
 	bool "MediaTek MT7601U"
 	help
