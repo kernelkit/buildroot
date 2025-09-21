@@ -4,8 +4,9 @@
 #
 ################################################################################
 
-FIREWALLD_VERSION = 2.0.2
-FIREWALLD_SITE = $(call github,firewalld,firewalld,v$(FIREWALLD_VERSION))
+FIREWALLD_VERSION = 2.3.1
+FIREWALLD_SITE = https://github.com/firewalld/firewalld/releases/download/v$(FIREWALLD_VERSION)
+FIREWALLD_SOURCE = firewalld-$(FIREWALLD_VERSION).tar.bz2
 FIREWALLD_LICENSE = GPL-2.0
 FIREWALLD_LICENSE_FILES = COPYING
 FIREWALLD_CPE_ID_VENDOR = firewalld
