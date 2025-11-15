@@ -20,6 +20,12 @@ LINUX_FIRMWARE_DIRS += amd-ucode
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENSE.amd-ucode
 endif
 
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_INSIDE_SECURE_MINIFW),y)
+LINUX_FIRMWARE_DIRS += inside-secure/eip197_minifw
+# No license file; the license is in the file WHENCE which
+# is installed unconditionally, see 'Inside Secure EIP197'
+endif
+
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_AMDGPU),y)
 LINUX_FIRMWARE_DIRS += amdgpu
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENSE.amdgpu
