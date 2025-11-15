@@ -17,6 +17,16 @@ config BR2_PACKAGE_LINUX_FIRMWARE_INTEL_SST_DSP
 
 endmenu # Audio
 
+menu "Crypto firmware"
+
+config BR2_PACKAGE_LINUX_FIRMWARE_INSIDE_SECURE_MINIFW
+	bool "MVEBU SafeXcel Crypto Engine 'minifw'"
+	help
+	  This is the 'minifw' firmware files for the EIP97 and EIP197 crypto
+	  engines found in Marvell Armada 37xx, 7k, 8k, and CN913x SoCs.
+
+endmenu # Crypto
+
 menu "Video firmware"
 
 config BR2_PACKAGE_LINUX_FIRMWARE_AMDGPU
