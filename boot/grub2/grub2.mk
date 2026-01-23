@@ -14,6 +14,11 @@ GRUB2_DEPENDENCIES = host-bison host-flex host-gawk host-grub2 \
 HOST_GRUB2_DEPENDENCIES = host-bison host-flex host-gawk \
 	$(BR2_PYTHON3_HOST_DEPENDENCY)
 GRUB2_INSTALL_IMAGES = YES
+ # Required due to patch that we adds a patch to achieve search for uuid
+define GRUB2_RUN_AUTOGEN
+        cd $(@D) && ./autogen.sh
+endef
+GRUB2_PRE_CONFIGURE_HOOKS += GRUB2_RUN_AUTOGEN
 
 # 0004-fs-hfs-Fix-stack-OOB-write-with-grub_strcpy.patch (yes, two
 # CVEs are fixed by this patch)
