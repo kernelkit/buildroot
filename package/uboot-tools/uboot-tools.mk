@@ -82,12 +82,6 @@ define UBOOT_TOOLS_INSTALL_MKENVIMAGE
 endef
 endif
 
-ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FDT_ADD_PUBKEY),y)
-define UBOOT_TOOLS_INSTALL_FDT_ADD_PUBKEY
-	$(INSTALL) -m 0755 -D $(@D)/tools/fdt_add_pubkey $(TARGET_DIR)/usr/bin/fdt_add_pubkey
-endef
-endif
-
 ifeq ($(BR2_PACKAGE_UBOOT_TOOLS_FWPRINTENV),y)
 define UBOOT_TOOLS_INSTALL_FWPRINTENV
 	$(INSTALL) -m 0755 -D $(@D)/tools/env/fw_printenv $(TARGET_DIR)/usr/sbin/fw_printenv
@@ -113,7 +107,6 @@ define UBOOT_TOOLS_INSTALL_TARGET_CMDS
 	$(UBOOT_TOOLS_INSTALL_FWPRINTENV)
 	$(UBOOT_TOOLS_INSTALL_DUMPIMAGE)
 	$(UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN)
-	$(UBOOT_TOOLS_INSTALL_FDT_ADD_PUBKEY)
 endef
 
 # host-uboot-tools
@@ -148,6 +141,14 @@ HOST_UBOOT_TOOLS_MAKE_OPTS += CONFIG_TOOLS_FIT_SIGNATURE=y
 HOST_UBOOT_TOOLS_DEPENDENCIES += host-openssl
 define HOST_UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN
 	$(INSTALL) -m 0755 -D $(@D)/tools/fit_check_sign $(HOST_DIR)/bin/fit_check_sign
+endef
+endif
+
+ifeq ($(BR2_PACKAGE_HOST_UBOOT_TOOLS_FDT_ADD_PUBKEY),y)
+HOST_UBOOT_TOOLS_MAKE_OPTS += CONFIG_TOOLS_LIBCRYPTO=y
+HOST_UBOOT_TOOLS_DEPENDENCIES += host-openssl
+define HOST_UBOOT_TOOLS_INSTALL_FDT_ADD_PUBKEY
+	$(INSTALL) -m 0755 -D $(@D)/tools/fdt_add_pubkey $(HOST_DIR)/usr/bin/fdt_add_pubkey
 endef
 endif
 
@@ -234,8 +235,8 @@ define HOST_UBOOT_TOOLS_INSTALL_CMDS
 	$(INSTALL) -m 0755 -D $(@D)/tools/mkeficapsule $(HOST_DIR)/bin/mkeficapsule
 	$(INSTALL) -m 0755 -D $(@D)/tools/mkenvimage $(HOST_DIR)/bin/mkenvimage
 	$(INSTALL) -m 0755 -D $(@D)/tools/dumpimage $(HOST_DIR)/bin/dumpimage
-	$(INSTALL) -m 0755 -D $(@D)/tools/fdt_add_pubkey $(HOST_DIR)/bin/fdt_add_pubkey
 	$(HOST_UBOOT_TOOLS_INSTALL_FIT_CHECK_SIGN)
+	$(HOST_UBOOT_TOOLS_INSTALL_FDT_ADD_PUBKEY)
 	$(INSTALL) -m 0755 -D $(@D)/tools/env/fw_printenv $(HOST_DIR)/bin/fw_printenv
 	ln -sf fw_printenv $(HOST_DIR)/bin/fw_setenv
 	$(HOST_UBOOT_TOOLS_INSTALL_ENVIMAGE)
