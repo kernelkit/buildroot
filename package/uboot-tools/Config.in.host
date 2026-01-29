@@ -37,6 +37,15 @@ config BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SIGNATURE_SUPPORT
 	  public key is stored in a non-volatile place, any image can
 	  be verified in this way.
 
+config BR2_PACKAGE_HOST_UBOOT_TOOLS_FDT_ADD_PUBKEY
+	bool "FIT public key embedding support"
+	help
+	  Build and install fdt_add_pubkey, a tool for adding public keys
+	  to U-Boot device tree blobs for FIT image signature verification.
+	  This allows separating the kernel and U-Boot builds, particularly
+	  useful in environments where embedding public keys in U-boot
+	  without having private keys on the same build host is desired.
+
 endif # BR2_PACKAGE_HOST_UBOOT_TOOLS_FIT_SUPPORT
 
 config BR2_PACKAGE_HOST_UBOOT_TOOLS_ENVIMAGE
