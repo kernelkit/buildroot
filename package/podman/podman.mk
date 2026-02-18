@@ -4,43 +4,24 @@
 #
 ################################################################################
 
-PODMAN_VERSION = v5.7.0
-PODMAN_SITE = https://github.com/containers/podman
-PODMAN_SITE_METHOD = git
-
+PODMAN_VERSION = 4.9.5
+PODMAN_SITE = $(call github,containers,podman,v$(PODMAN_VERSION))
 PODMAN_LICENSE = Apache-2.0
 PODMAN_LICENSE_FILES = LICENSE
 
-PODMAN_DEPENDENCIES = host-pkgconf libgpgme
+PODMAN_CPE_ID_VENDOR = podman_project
+PODMAN_GOMOD = github.com/containers/podman/v4
 
-PODMAN_GOMOD = github.com/containers/podman/v5
-PODMAN_BUILD_TARGETS = cmd/podman
-PODMAN_TAGS = selinux
+PODMAN_BUILD_TARGETS = cmd/podman cmd/rootlessport cmd/quadlet
+PODMAN_DEPENDENCIES += libgpgme
+PODMAN_LDFLAGS = \
+	-X $(PODMAN_GOMOD)/libpod/define.gitCommit=$(PODMAN_VERSION)
+PODMAN_TAGS = \
+	btrfs_noversion containers_image_openpgp \
+	exclude_graphdriver_devicemapper exclude_graphdriver_zfs
 
-# https://podman.io/docs/installation#get-source-code mandates that flag be
-# set, as device-mapper is not officially supported.
-PODMAN_TAGS += exclude_graphdriver_devicemapper
-
-# This is supposedly optional, but a basic (busybox:latest) image does not
-# even start without seccomp support, unless by passing extra options at
-# runtime (--security-opt=seccomp=unconfined), which can't be made the default.
-PODMAN_DEPENDENCIES += libseccomp
-PODMAN_TAGS += seccomp
-
-# This is required for rootless containers, i.e containers started by non-root
-PODMAN_DEPENDENCIES += shadow
-PODMAN_TAGS += libsubid
-
-PODMAN_CPE_ID_VERSION = $(subst v,,$(PODMAN_VERSION))
-
-ifeq ($(BR2_PACKAGE_BTRFS_PROGS),y)
-PODMAN_DEPENDENCIES += btrfs-progs
-define PODMAN_LINUX_CONFIG_FIXUPS_BTRFS
-	$(call KCONFIG_ENABLE_OPT,CONFIG_BTRFS_FS)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_BTRFS_FS_POSIX_ACL)
-endef
-else
-PODMAN_TAGS += exclude_graphdriver_btrfs
+ifeq ($(BR2_INIT_SYSTEMD),y)
+PODMAN_TAGS += systemd
 endif
 
 ifeq ($(BR2_PACKAGE_LIBAPPARMOR),y)
@@ -48,39 +29,75 @@ PODMAN_DEPENDENCIES += libapparmor
 PODMAN_TAGS += apparmor
 endif
 
-ifeq ($(BR2_PACKAGE_SYSTEMD),y)
-PODMAN_DEPENDENCIES += systemd
-PODMAN_TAGS += systemd
-endif
-
-PODMAN_INIT_NAME = $(call qstrip,$(BR2_PACKAGE_PODMAN_INIT_NAME))
-ifneq ($(PODMAN_INIT_NAME),)
-PODMAN_INIT_PATH = /usr/libexec/podman/$(PODMAN_INIT_NAME)
-define PODMAN_HELPER_INIT
-	$(Q)ln -sf ../../bin/$(PODMAN_INIT_NAME) $(TARGET_DIR)$(PODMAN_INIT_PATH)
-	$(Q)mkdir -p $(TARGET_DIR)/etc/containers/containers.conf.d
-	$(Q)printf '[containers]\ninit_path = "%s"\n' "$(PODMAN_INIT_PATH)" \
-		>$(TARGET_DIR)/etc/containers/containers.conf.d/50-buildroot-init.conf
+ifeq ($(BR2_PACKAGE_LIBSECCOMP),y)
+PODMAN_TAGS += seccomp
+PODMAN_DEPENDENCIES += libseccomp host-pkgconf
+else
+define PODMAN_SECCOMP_PROFILE
+	$(INSTALL) -D -m 644 $(PODMAN_PKGDIR)/unconfined.conf \
+		$(TARGET_DIR)/etc/containers/containers.conf
 endef
 endif
 
-ifeq ($(BR2_PACKAGE_PODMAN_NET_PASST),y)
-define PODMAN_HELPER_PASST
-	$(Q)ln -sf ../../bin/pasta $(TARGET_DIR)/usr/libexec/podman/pasta
+ifeq ($(BR2_PACKAGE_LIBSELINUX),y)
+PODMAN_TAGS += selinux
+PODMAN_DEPENDENCIES += libselinux
+endif
+
+ifeq ($(BR2_PACKAGE_PODMAN_DRIVER_BTRFS),y)
+PODMAN_DEPENDENCIES += btrfs-progs
+define PODMAN_BTFRS_DRIVER_CONFIG_FIXUPS
+	$(call KCONFIG_ENABLE_OPT,CONFIG_BTRFS_FS)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_BTRFS_FS_POSIX_ACL)
 endef
 else
-define PODMAN_HELPER_SLIRP4NETNS
-	$(Q)ln -sf ../../bin/slirp4netns $(TARGET_DIR)/usr/libexec/podman/slirp4netns
-	$(Q)mkdir -p $(TARGET_DIR)/etc/containers/containers.conf.d
-	$(Q)printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' \
-		>$(TARGET_DIR)/etc/containers/containers.conf.d/50-buildroot-net-backend.conf
+PODMAN_TAGS += exclude_graphdriver_btrfs
+endif
+
+ifeq ($(BR2_PACKAGE_PODMAN_DRIVER_DEVICEMAPPER),y)
+PODMAN_DEPENDENCIES += lvm2
+define PODMAN_DEVICEMAPPER_DRIVER_CONFIG_FIXUPS
+	$(call KCONFIG_ENABLE_OPT,CONFIG_MD)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_BLK_DEV_DM)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_MD_THIN_PROVISIONING)
+endef
+else
+PODMAN_TAGS += exclude_graphdriver_devicemapper
+endif
+
+ifeq ($(BR2_PACKAGE_PODMAN_DRIVER_VFS),y)
+PODMAN_DEPENDENCIES += gvfs
+else
+PODMAN_TAGS += exclude_graphdriver_vfs
+endif
+
+ifeq ($(BR2_PACKAGE_BASH_COMPLETION),y)
+define PODMAN_BASH_COMPLETION
+	$(INSTALL) -D -m 644 $(@D)/completions/bash/podman \
+		$(TARGET_DIR)/usr/share/bash-completion/completions/
 endef
 endif
 
+define PODMAN_INSTALL_TARGET_CMDS
+	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) DESTDIR=$(TARGET_DIR) PREFIX=/usr \
+		install.bin
+	$(INSTALL) -d -m 700 $(TARGET_DIR)/etc/cni
+	$(INSTALL) -d -m 700 $(TARGET_DIR)/etc/cni/net.d
+	$(INSTALL) -D -m 644 $(@D)/cni/87-podman-bridge.conflist \
+		$(TARGET_DIR)/etc/cni/net.d/87-podman-bridge.conflist
+	$(INSTALL) -d -m 755 $(TARGET_DIR)/etc/containers
+	$(INSTALL) -D -m 644 $(PODMAN_PKGDIR)/containers-policy.json \
+		$(TARGET_DIR)/etc/containers/policy.json
+	$(PODMAN_SECCOMP_PROFILE)
+	$(PODMAN_BASH_COMPLETION)
+endef
+
+define PODMAN_INSTALL_INIT_SYSTEMD
+	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) DESTDIR=$(TARGET_DIR) PREFIX=/usr \
+		install.systemd
+endef
+
 define PODMAN_LINUX_CONFIG_FIXUPS
-	$(call KCONFIG_ENABLE_OPT,CONFIG_CPUSETS)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_BPF_SYSCALL)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_POSIX_MQUEUE)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_MEMCG)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUPS)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUP_SCHED)
@@ -88,27 +105,34 @@ define PODMAN_LINUX_CONFIG_FIXUPS
 	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUP_DEVICE)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUP_CPUACCT)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUP_PIDS)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_CGROUP_BPF)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_CPUSETS)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_NAMESPACES)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_UTS_NS)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_IPC_NS)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_PID_NS)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_USER_NS)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_NET_NS)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_SECCOMP)
-	$(call KCONFIG_ENABLE_OPT,CONFIG_OVERLAY_FS)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_USER_NS)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_ADVANCED)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_BRIDGE_NETFILTER)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NF_CONNTRACK)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_XTABLES)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_XT_MATCH_ADDRTYPE)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_XT_MATCH_CONNTRACK)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_XT_MATCH_IPVS)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NETFILTER_XT_MATCH_COMMENT)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_IP_NF_IPTABLES)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_IP_NF_FILTER)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_IP_NF_NAT)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_IP_NF_TARGET_MASQUERADE)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_BRIDGE)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_NET_CORE)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_VETH)
 	$(call KCONFIG_ENABLE_OPT,CONFIG_KEYS)
-	$(PODMAN_LINUX_CONFIG_FIXUPS_BTRFS)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_POSIX_MQUEUE)
+	$(call KCONFIG_ENABLE_OPT,CONFIG_OVERLAY_FS)
+	$(PODMAN_BTFRS_DRIVER_CONFIG_FIXUPS)
+	$(PODMAN_DEVICEMAPPER_DRIVER_CONFIG_FIXUPS)
 endef
-
-define PODMAN_HELPERS
-	$(Q)mkdir -p $(TARGET_DIR)/usr/libexec/podman
-	$(Q)ln -sf ../../bin/aardvark-dns $(TARGET_DIR)/usr/libexec/podman/aardvark-dns
-	$(Q)ln -sf ../../bin/netavark $(TARGET_DIR)/usr/libexec/podman/netavark
-	$(PODMAN_HELPER_INIT)
-	$(PODMAN_HELPER_PASST)
-	$(PODMAN_HELPER_SLIRP4NETNS)
-endef
-PODMAN_POST_INSTALL_TARGET_HOOKS += PODMAN_HELPERS
 
 $(eval $(golang-package))
