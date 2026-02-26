@@ -26,7 +26,6 @@ FRR_AUTORECONF = YES
 FRR_INSTALL_STAGING = YES
 
 FRR_DEPENDENCIES = host-frr readline json-c libyang \
-	protobuf-c grpc host-grpc \
 	$(if $(BR2_PACKAGE_C_ARES),c-ares) \
 	$(if $(BR2_PACKAGE_LIBXCRYPT),libxcrypt)
 
@@ -47,8 +46,7 @@ FRR_CONF_OPTS = --with-clippy=$(HOST_DIR)/bin/clippy \
 	--enable-user=frr \
 	--enable-group=frr \
 	--enable-vty-group=frrvty \
-	--enable-fpm \
-	--enable-grpc
+	--enable-fpm
 
 HOST_FRR_CONF_OPTS = --enable-clippy-only
 
@@ -89,6 +87,14 @@ ifeq ($(BR2_PACKAGE_FRR_BFD),y)
 FRR_CONF_OPTS += --enable-bfdd
 else
 FRR_CONF_OPTS += --disable-bfdd
+endif
+
+# Optional gRPC northbound API support
+ifeq ($(BR2_PACKAGE_FRR_GRPC),y)
+FRR_DEPENDENCIES += grpc host-grpc
+FRR_CONF_OPTS += --enable-grpc
+else
+FRR_CONF_OPTS += --disable-grpc
 endif
 
 # Optional protobuf support
