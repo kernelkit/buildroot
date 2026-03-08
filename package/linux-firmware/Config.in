@@ -449,6 +449,13 @@ config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7610E
 	help
 	  MediaTek MT7610E
 
+config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7615
+	bool "MediaTek MT7615"
+	help
+	  Firmware for the MediaTek MT7615 802.11ac (Wi-Fi 5) chip, supporting
+	  up to 1733 Mbps PHY rate. Used in, e.g., the Banana Pi BPI-MT7615
+	  M.2 PCIe card for the BPi-R64.
+
 config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT76X2E
 	bool "MediaTek MT76x2e"
 	help

@@ -392,6 +392,13 @@ LINUX_FIRMWARE_FILES += mediatek/mt7650.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
 endif
 
+# MT7615
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7615),y)
+LINUX_FIRMWARE_FILES += mediatek/mt7615_cr4.bin mediatek/mt7615_n9.bin \
+			mediatek/mt7615_rom_patch.bin
+LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
+endif
+
 # MT76x2e
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT76X2E),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7662.bin mediatek/mt7662_rom_patch.bin
