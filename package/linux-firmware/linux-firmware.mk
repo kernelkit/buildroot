@@ -374,6 +374,16 @@ LINUX_FIRMWARE_FILES += mediatek/mt7986_eeprom_mt7975_dual.bin \
 			mediatek/mt7986_wo_1.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
 endif
+# MT7996
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7996),y)
+LINUX_FIRMWARE_FILES += mediatek/mt7996/mt7996_dsp.bin \
+			mediatek/mt7996/mt7996_eeprom.bin \
+			mediatek/mt7996/mt7996_eeprom_2i5i6i.bin \
+			mediatek/mt7996/mt7996_rom_patch.bin \
+			mediatek/mt7996/mt7996_wa.bin \
+			mediatek/mt7996/mt7996_wm.bin
+LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
+endif
 # MT7601
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7601U),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7601u.bin
