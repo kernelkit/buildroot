@@ -439,6 +439,12 @@ config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7986
        help
 	MediaTek MT7986 SOC WiFi
 
+config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7988
+	bool "MediaTek MT7988 SOC PHY"
+	help
+	  MediaTek MT7988 (Filogic 880) built-in 2.5GbE PHY microcode.
+	  Required by the MEDIATEK_2P5GE_PHY kernel driver.
+
 config BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7996
        bool "MediaTek MT7996 WiFi 7"
        help
