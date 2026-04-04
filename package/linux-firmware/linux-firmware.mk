@@ -374,6 +374,13 @@ LINUX_FIRMWARE_FILES += mediatek/mt7986_eeprom_mt7975_dual.bin \
 			mediatek/mt7986_wo_1.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
 endif
+# MT7988 built-in 2.5GbE PHY microcode (required by MEDIATEK_2P5GE_PHY driver)
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7988),y)
+LINUX_FIRMWARE_FILES += mediatek/mt7988/i2p5ge-phy-pmb.bin \
+			mediatek/mt7988/mt7988_wo_0.bin \
+			mediatek/mt7988/mt7988_wo_1.bin
+LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
+endif
 # MT7996
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7996),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7996/mt7996_dsp.bin \
