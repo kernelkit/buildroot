@@ -415,10 +415,12 @@ LINUX_FIRMWARE_FILES += mediatek/mt7650.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
 endif
 
-# MT7615
+# MT7615 (PCIe) and MT7622 (SoC WMAC, uses the mt7615e driver)
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7615),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7615_cr4.bin mediatek/mt7615_n9.bin \
-			mediatek/mt7615_rom_patch.bin
+			mediatek/mt7615_rom_patch.bin \
+			mediatek/mt7622_n9.bin mediatek/mt7622_rom_patch.bin \
+			mediatek/mt7622pr2h.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
 endif
 
