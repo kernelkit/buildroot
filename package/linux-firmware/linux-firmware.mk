@@ -365,6 +365,14 @@ LINUX_FIRMWARE_FILES += mrvl/pcieusb8997_combo_v4.bin
 LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.Marvell
 endif
 
+# MT7916
+ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7916),y)
+LINUX_FIRMWARE_FILES += mediatek/mt7916_eeprom.bin \
+			mediatek/mt7916_rom_patch.bin \
+			mediatek/mt7916_wa.bin \
+			mediatek/mt7916_wm.bin
+LINUX_FIRMWARE_ALL_LICENSE_FILES += LICENCE.ralink_a_mediatek_company_firmware
+endif
 # MT7986
 ifeq ($(BR2_PACKAGE_LINUX_FIRMWARE_MEDIATEK_MT7986),y)
 LINUX_FIRMWARE_FILES += mediatek/mt7986_eeprom_mt7975_dual.bin \
