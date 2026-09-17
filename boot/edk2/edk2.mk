@@ -158,6 +158,12 @@ EDK2_PACKAGES_PATH = $(subst $(space),:,$(strip $(EDK2_PACKAGES_PATHS)))
 # order to stay in that configuration, we avoid leaking top-level
 # Buildroot make flags into EDK2 build by clearing the MAKEFLAGS
 # environment variable.
+#
+# The bundled parser generator relies on K&R-style function
+# declarations which were removed with C23. Since version 15 GCC uses
+# C23 by default, so we explictly request the previous version. We
+# must do so via CC, since the affected Makefiles override any flags
+# passed in via EXTRA_OPTFLAGS above.
 EDK2_BUILD_ENV += \
 	MAKEFLAGS= \
 	WORKSPACE=$(@D) \
@@ -165,7 +171,8 @@ EDK2_BUILD_ENV += \
 	PYTHON_COMMAND=$(HOST_DIR)/bin/python3 \
 	IASL_PREFIX=$(HOST_DIR)/bin/ \
 	NASM_PREFIX=$(HOST_DIR)/bin/ \
-	GCC5_$(EDK2_ARCH)_PREFIX=$(TARGET_CROSS)
+	GCC5_$(EDK2_ARCH)_PREFIX=$(TARGET_CROSS) \
+	CC="$(HOSTCC) -std=gnu17"
 
 EDK2_BUILD_OPTS += \
 	-t GCC5 \
