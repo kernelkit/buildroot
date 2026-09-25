@@ -13,10 +13,10 @@ config BR2_PACKAGE_NETOPEER2
 	depends on BR2_TOOLCHAIN_HAS_THREADS_NPTL
 	depends on BR2_TOOLCHAIN_GCC_AT_LEAST_4_8 # sysrepo
 	select BR2_PACKAGE_LIBNETCONF2
-	select BR2_PACKAGE_LIBSSH
-	select BR2_PACKAGE_LIBSSH_SERVER # For libnetconf2 to have SSH
+	select BR2_PACKAGE_LIBSSH if !BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM
+	select BR2_PACKAGE_LIBSSH_SERVER if !BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM # For libnetconf2 to have SSH
 	select BR2_PACKAGE_LIBYANG
-	select BR2_PACKAGE_OPENSSL # For libnetconf2 to have TLS
+	select BR2_PACKAGE_OPENSSL if !BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM # For libnetconf2 to have TLS
 	select BR2_PACKAGE_SYSREPO
 	help
 	  Netopeer2 is a set of tools implementing network configuration
@@ -30,7 +30,11 @@ if BR2_PACKAGE_NETOPEER2
 
 config BR2_PACKAGE_NETOPEER2_CLI
 	bool "cli"
+	depends on !BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM # needs libssh
 	help
 	  Enable netopeer2 CLI.
+
+comment "netopeer2 cli needs libnetconf2 with its own SSH transport"
+	depends on BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM
 
 endif

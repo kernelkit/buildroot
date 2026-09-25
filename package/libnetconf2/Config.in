@@ -16,3 +16,19 @@ comment "libnetconf2 needs a toolchain w/ threads, dynamic library"
 	depends on BR2_USE_MMU
 	depends on BR2_TOOLCHAIN_HAS_SYNC_4
 	depends on BR2_STATIC_LIBS || !BR2_TOOLCHAIN_HAS_THREADS
+
+config BR2_PACKAGE_LIBNETCONF2_SSH_SUBSYSTEM
+	bool "serve NETCONF as an OpenSSH subsystem"
+	depends on BR2_PACKAGE_LIBNETCONF2
+	depends on BR2_PACKAGE_OPENSSH
+	help
+	  Let the OpenSSH daemon own the SSH transport.  It authenticates
+	  the user and runs the netconf-subsystem helper, which bridges
+	  the session to the UNIX socket of a libnetconf2 server such as
+	  netopeer2-server.  libnetconf2 is then built without its own
+	  SSH and TLS transports, so libssh is not needed and call-home
+	  and NETCONF over TLS are not available.
+
+	  Add to sshd_config:
+
+	    Subsystem netconf /usr/libexec/libnetconf2/netconf-subsystem
