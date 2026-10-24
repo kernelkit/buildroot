@@ -1,0 +1,713 @@
+From bc8ec4a7ffaff9d8519856a439f7bd4042f0c0ef Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 18:08:26 +0200
+Subject: [PATCH] notifd FEATURE yang-push on-change subscriptions
+
+Configured RFC 8641 datastore subscriptions with an on-change update
+trigger, its dampening period and excluded changes. The validation
+rejects an on-change subscription of factory-default, which has no
+changes to subscribe to, and a dampening period that does not fit in
+milliseconds.
+
+Every receiver has an srsn subscription of its own, started without
+sync-on-start. The daemon requests the resync itself whenever a
+receiver becomes active and after every resubscribe instead, so a
+receiver that reconnects, and one whose subscription was modified,
+gets a new baseline, and no change between the snapshot and the SR
+subscription is lost.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/6ddd6e707ec2c5669e55fdd64c8b44013c3243c8
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/executables/sysrepo-notifd/notifd.h       |  15 +-
+ .../sysrepo-notifd/notifd_common.h            |  15 ++
+ .../sysrepo-notifd/notifd_config.c            | 127 ++++++++--
+ .../sysrepo-notifd/notifd_control.c           |   9 +-
+ .../sysrepo-notifd/notifd_runtime.c           |  42 ++++
+ .../sysrepo-notifd/sysrepo-notifd.8           |  10 +-
+ tests/notifd/test_notifd_yang_push.c          | 222 ++++++++++++++++++
+ tests/notifd/tnotifd.h                        |   2 +-
+ 8 files changed, 406 insertions(+), 36 deletions(-)
+
+diff --git a/src/executables/sysrepo-notifd/notifd.h b/src/executables/sysrepo-notifd/notifd.h
+index 65ae22d2..8a2d5a84 100644
+--- a/src/executables/sysrepo-notifd/notifd.h
++++ b/src/executables/sysrepo-notifd/notifd.h
+@@ -421,6 +421,9 @@ typedef struct notif_srsn_params_s {
+     sr_datastore_t ds;                  /**< datastore */
+     uint32_t period;                    /**< period in centiseconds, periodic only */
+     struct timespec anchor_time;        /**< optional anchor time, periodic only */
++    uint32_t dampening_period;          /**< dampening period in centiseconds, on-change only */
++    int excluded_changes[SRSN_COUNT_YP_CHANGE]; /**< changes that are not reported, indexed by
++                                                     ::srsn_yp_change_t, on-change only */
+ } notif_srsn_params_t;
+ 
+ /**
+@@ -446,12 +449,14 @@ struct notif_sub_s {
+     char *purpose;                      /**< purpose of the subscription */
+     char *local_address;                /**< local address to send notifications from (NULL means OS default) */
+ 
+-    notif_srsn_params_t srsn_params;    /**< parameters of the srsn subscription of every receiver */
+-    char *filter_ref;                   /**< optional stream-filter-name or selection-filter-ref, by type */
++    notif_srsn_params_t srsn_params;    /**< arguments of the srsn subscriptions of the receivers */
+ 
+-    /* event stream subscriptions only */
+-    int replay;                         /**< whether to replay notifications */
+-    struct timespec replay_start_time;  /**< actual replay start time returned by srsn_subscribe */
++    /* notifd only, not passed to srsn */
++    char *filter_ref;                   /**< optional stream-filter-name or selection-filter-ref, by type */
++    int replay;                         /**< whether to replay notifications, event stream only */
++    struct timespec replay_start_time;  /**< actual replay start time returned by srsn_subscribe, event stream
++                                             only */
++    int sync_on_start;                  /**< whether every receiver starts with a push-update, on-change only */
+ 
+     notif_receiver_t *receivers;        /**< receivers of this subscription (sized-array, see libyang docs) */
+ };
+diff --git a/src/executables/sysrepo-notifd/notifd_common.h b/src/executables/sysrepo-notifd/notifd_common.h
+index 0d890c16..0d106723 100644
+--- a/src/executables/sysrepo-notifd/notifd_common.h
++++ b/src/executables/sysrepo-notifd/notifd_common.h
+@@ -48,6 +48,14 @@ const notif_transport_ops_t *notif_transport_find_by_identity(const char *identi
+  */
+ int notif_ds_from_identity(const char *identity, sr_datastore_t *ds);
+ 
++/**
++ * @brief Map a yang-push change to its excluded-change value.
++ *
++ * @param[in] change yang-push change, a valid one.
++ * @return excluded-change value.
++ */
++const char *notif_yp_change2str(srsn_yp_change_t change);
++
+ /**
+  * @brief Map a sysrepo datastore of a yang-push subscription to its identity.
+  *
+@@ -624,6 +632,13 @@ int notif_receiver_resolve(notif_receiver_t *receiver);
+  */
+ void notif_receiver_disconnect(notif_receiver_t *receiver);
+ 
++/**
++ * @brief Request a push-update for an active receiver of an on-change subscription with sync-on-start.
++ *
++ * @param[in] receiver Active receiver.
++ */
++void notif_receiver_sync_on_start(notif_receiver_t *receiver);
++
+ /**
+  * @brief Attempt to reconnect a disconnected receiver using exponential backoff.
+  *
+diff --git a/src/executables/sysrepo-notifd/notifd_config.c b/src/executables/sysrepo-notifd/notifd_config.c
+index 7ce91ff0..6397a45d 100644
+--- a/src/executables/sysrepo-notifd/notifd_config.c
++++ b/src/executables/sysrepo-notifd/notifd_config.c
+@@ -33,6 +33,31 @@
+ void receiver_destroy(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, notif_receiver_t *receiver);
+ static void receiver_instance_destroy(notifd_ctx_t *notifd_ctx, notif_receiver_inst_t *recv_inst);
+ 
++/**
++ * @brief Datastore identities of yang-push subscriptions, ietf-datastores:intended has no sysrepo datastore.
++ */
++static const struct {
++    const char *identity;
++    sr_datastore_t ds;
++} notif_ds_map[] = {
++    {"ietf-datastores:running", SR_DS_RUNNING},
++    {"ietf-datastores:startup", SR_DS_STARTUP},
++    {"ietf-datastores:candidate", SR_DS_CANDIDATE},
++    {"ietf-datastores:operational", SR_DS_OPERATIONAL},
++    {"ietf-factory-default:factory-default", SR_DS_FACTORY_DEFAULT},
++};
++
++/**
++ * @brief Values of the excluded-change leaf-list, indexed by ::srsn_yp_change_t.
++ */
++static const char *notif_yp_change_names[SRSN_COUNT_YP_CHANGE] = {
++    [SRSN_YP_CHANGE_CREATE] = "create",
++    [SRSN_YP_CHANGE_DELETE] = "delete",
++    [SRSN_YP_CHANGE_INSERT] = "insert",
++    [SRSN_YP_CHANGE_MOVE] = "move",
++    [SRSN_YP_CHANGE_REPLACE] = "replace",
++};
++
+ /*
+  * ---------------------------------------------------------------------------
+  * Transport registry
+@@ -385,20 +410,6 @@ notif_encoding_parse(const struct lyd_node *node, notif_encoding_t *encoding)
+     return rc;
+ }
+ 
+-/**
+- * @brief Datastore identities of yang-push subscriptions, ietf-datastores:intended has no sysrepo datastore.
+- */
+-static const struct {
+-    const char *identity;
+-    sr_datastore_t ds;
+-} notif_ds_map[] = {
+-    {"ietf-datastores:running", SR_DS_RUNNING},
+-    {"ietf-datastores:startup", SR_DS_STARTUP},
+-    {"ietf-datastores:candidate", SR_DS_CANDIDATE},
+-    {"ietf-datastores:operational", SR_DS_OPERATIONAL},
+-    {"ietf-factory-default:factory-default", SR_DS_FACTORY_DEFAULT},
+-};
+-
+ int
+ notif_ds_from_identity(const char *identity, sr_datastore_t *ds)
+ {
+@@ -428,6 +439,32 @@ notif_ds2identity(sr_datastore_t ds)
+     return NULL;
+ }
+ 
++const char *
++notif_yp_change2str(srsn_yp_change_t change)
++{
++    return notif_yp_change_names[change];
++}
++
++/**
++ * @brief Map a value of the excluded-change leaf-list to a yang-push change.
++ *
++ * @param[in] str excluded-change value.
++ * @return yang-push change, ::SRSN_YP_CHANGE_INVALID if unknown.
++ */
++static srsn_yp_change_t
++notif_yp_change_from_str(const char *str)
++{
++    int i;
++
++    for (i = 0; i < SRSN_COUNT_YP_CHANGE; ++i) {
++        if (!strcmp(notif_yp_change_names[i], str)) {
++            return i;
++        }
++    }
++
++    return SRSN_YP_CHANGE_INVALID;
++}
++
+ /**
+  * @brief Get the XPath filter of a filter choice, a subtree filter converted.
+  *
+@@ -1031,11 +1068,14 @@ subscription_target_free(notif_sub_t *sub)
+     sub->srsn_params.ds = 0;
+     sub->srsn_params.period = 0;
+     memset(&sub->srsn_params.anchor_time, 0, sizeof sub->srsn_params.anchor_time);
++    sub->srsn_params.dampening_period = 0;
++    memset(sub->srsn_params.excluded_changes, 0, sizeof sub->srsn_params.excluded_changes);
+ 
+     free(sub->filter_ref);
+     sub->filter_ref = NULL;
+     sub->replay = 0;
+     memset(&sub->replay_start_time, 0, sizeof sub->replay_start_time);
++    sub->sync_on_start = 0;
+ }
+ 
+ /**
+@@ -1108,10 +1148,14 @@ subscription_ds_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, con
+         const struct lyd_node *ds_node)
+ {
+     int rc = SR_ERR_OK;
+-    struct lyd_node *n, *periodic;
++    struct lyd_node *n, *periodic, *on_change;
++    struct ly_set *set = NULL;
++    srsn_yp_change_t change;
++    uint32_t i;
+ 
+-    /* update trigger */
++    /* update trigger, the validation rejects a subscription without one */
+     get_descendant_optional(sub_node, "ietf-yang-push:periodic", &periodic);
++    get_descendant_optional(sub_node, "ietf-yang-push:on-change", &on_change);
+     if (periodic) {
+         sub->srsn_params.type = SRSN_YANG_PUSH_PERIODIC;
+         if ((rc = get_descendant_mandatory(periodic, "period", &n))) {
+@@ -1126,9 +1170,24 @@ subscription_ds_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, con
+             }
+         }
+     } else {
+-        SRNTF_LOG_ERR("Subscription ID %" PRIu32 " has no supported update trigger.", sub->id);
+-        rc = SR_ERR_UNSUPPORTED;
+-        goto cleanup;
++        assert(on_change);
++        sub->srsn_params.type = SRSN_YANG_PUSH_ON_CHANGE;
++        get_descendant_optional(on_change, "dampening-period", &n);
++        if (n) {
++            sub->srsn_params.dampening_period = strtoul(lyd_get_value(n), NULL, 10);
++        }
++        get_descendant_optional(on_change, "sync-on-start", &n);
++        sub->sync_on_start = n ? ((struct lyd_node_term *)n)->value.boolean : 1;
++        if (lyd_find_xpath(on_change, "excluded-change", &set)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++        for (i = 0; i < set->count; ++i) {
++            /* an enum value, all of them are mapped */
++            change = notif_yp_change_from_str(lyd_get_value(set->dnodes[i]));
++            assert(change != SRSN_YP_CHANGE_INVALID);
++            sub->srsn_params.excluded_changes[change] = 1;
++        }
+     }
+ 
+     /* datastore */
+@@ -1151,6 +1210,7 @@ subscription_ds_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, con
+     }
+ 
+ cleanup:
++    ly_set_free(set, NULL);
+     return rc;
+ }
+ 
+@@ -1988,7 +2048,7 @@ sub_change_validate_datastore(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *sessio
+         const struct lyd_node *sub_node)
+ {
+     int rc = SR_ERR_OK;
+-    struct lyd_node *n, *policy;
++    struct lyd_node *n, *periodic, *on_change;
+     sr_datastore_t ds;
+     char *xpath_filter = NULL;
+     uint64_t period;
+@@ -2004,10 +2064,11 @@ sub_change_validate_datastore(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *sessio
+         goto cleanup;
+     }
+ 
+-    /* update trigger, the choice is not mandatory; the period is in centiseconds, SRSN takes milliseconds */
+-    get_descendant_optional(sub_node, "ietf-yang-push:periodic", &policy);
+-    if (policy) {
+-        get_descendant_optional(policy, "period", &n);
++    /* update trigger, the choice is not mandatory; the periods are in centiseconds, SRSN takes milliseconds */
++    get_descendant_optional(sub_node, "ietf-yang-push:periodic", &periodic);
++    get_descendant_optional(sub_node, "ietf-yang-push:on-change", &on_change);
++    if (periodic) {
++        get_descendant_optional(periodic, "period", &n);
+         period = n ? strtoull(lyd_get_value(n), NULL, 10) : 0;
+         if (!period || (period > UINT32_MAX / 10)) {
+             SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Period \"%s\" is not supported.",
+@@ -2015,9 +2076,23 @@ sub_change_validate_datastore(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *sessio
+             rc = SR_ERR_UNSUPPORTED;
+             goto cleanup;
+         }
++    } else if (on_change) {
++        if (ds == SR_DS_FACTORY_DEFAULT) {
++            /* there are no changes to subscribe to */
++            SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "On-change subscription of the factory-default "
++                    "datastore is not supported.");
++            rc = SR_ERR_UNSUPPORTED;
++            goto cleanup;
++        }
++        get_descendant_optional(on_change, "dampening-period", &n);
++        if (n && (strtoull(lyd_get_value(n), NULL, 10) > UINT32_MAX / 10)) {
++            SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Dampening period \"%s\" is not supported.",
++                    lyd_get_value(n));
++            rc = SR_ERR_UNSUPPORTED;
++            goto cleanup;
++        }
+     } else {
+-        SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Datastore subscription without a supported update "
+-                "trigger.");
++        SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Datastore subscription without an update trigger.");
+         rc = SR_ERR_UNSUPPORTED;
+         goto cleanup;
+     }
+diff --git a/src/executables/sysrepo-notifd/notifd_control.c b/src/executables/sysrepo-notifd/notifd_control.c
+index 5676b786..69c67fe5 100644
+--- a/src/executables/sysrepo-notifd/notifd_control.c
++++ b/src/executables/sysrepo-notifd/notifd_control.c
+@@ -208,7 +208,9 @@ notifd_ctl_srsn_subscribe(sr_session_ctx_t *sess, const notif_srsn_params_t *p,
+                 srsn_sub_id);
+         break;
+     case SRSN_YANG_PUSH_ON_CHANGE:
+-        r = SR_ERR_UNSUPPORTED;
++        /* the dampening period is in centiseconds, the push-update of sync-on-start is requested once active */
++        r = srsn_yang_push_on_change(sess, p->ds, p->xpath_filter, p->dampening_period * 10, 0,
++                (int *)p->excluded_changes, stop_time, 0, NULL, fd, srsn_sub_id);
+         break;
+     }
+ 
+@@ -304,6 +306,11 @@ notifd_ctl_start(notifd_ctx_t *notifd_ctx, const notif_srsn_params_t *params)
+     fd = -1;
+     srsn_sub_id = 0;
+ 
++    if (receiver->state == NOTIF_RECV_STATE_ACTIVE) {
++        /* an on-change subscription with sync-on-start starts with a push-update */
++        notif_receiver_sync_on_start(receiver);
++    }
++
+ cleanup_unlock:
+     /* STATE UNLOCK */
+     notifd_rwlock_unlock(&notifd_ctx->state_rwlock, __func__);
+diff --git a/src/executables/sysrepo-notifd/notifd_runtime.c b/src/executables/sysrepo-notifd/notifd_runtime.c
+index afe7dfac..f5732400 100644
+--- a/src/executables/sysrepo-notifd/notifd_runtime.c
++++ b/src/executables/sysrepo-notifd/notifd_runtime.c
+@@ -124,6 +124,7 @@ subscription_state_change_notif_yp_add(struct lyd_node *tree, const notif_sub_t
+ {
+     int rc = SR_ERR_OK;
+     char buf[11], *anchor_str = NULL;
++    int i;
+ 
+     if (fields & NOTIF_FIELD_TARGET) {
+         if (lyd_new_path(tree, NULL, "ietf-yang-push:datastore", notif_ds2identity(sub->srsn_params.ds), 0, NULL)) {
+@@ -146,6 +147,26 @@ subscription_state_change_notif_yp_add(struct lyd_node *tree, const notif_sub_t
+         }
+     }
+ 
++    if ((fields & NOTIF_FIELD_UPDATE_POLICY) && (sub->srsn_params.type == SRSN_YANG_PUSH_ON_CHANGE)) {
++        sprintf(buf, "%" PRIu32, sub->srsn_params.dampening_period);
++        if (lyd_new_path(tree, NULL, "ietf-yang-push:on-change/dampening-period", buf, 0, NULL)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++        if (lyd_new_path(tree, NULL, "ietf-yang-push:on-change/sync-on-start", sub->sync_on_start ? "true" : "false",
++                0, NULL)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++        for (i = 0; i < SRSN_COUNT_YP_CHANGE; ++i) {
++            if (sub->srsn_params.excluded_changes[i] && lyd_new_path(tree, NULL,
++                    "ietf-yang-push:on-change/excluded-change", notif_yp_change2str(i), 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        }
++    }
++
+     if ((fields & NOTIF_FIELD_UPDATE_POLICY) && (sub->srsn_params.type == SRSN_YANG_PUSH_PERIODIC)) {
+         sprintf(buf, "%" PRIu32, sub->srsn_params.period);
+         if (lyd_new_path(tree, NULL, "ietf-yang-push:periodic/period", buf, 0, NULL)) {
+@@ -496,6 +517,21 @@ notif_receiver_backoff_sec(const notif_receiver_t *receiver)
+     return backoff_sec;
+ }
+ 
++void
++notif_receiver_sync_on_start(notif_receiver_t *receiver)
++{
++    notif_sub_t *sub = receiver->sub;
++
++    if ((sub->srsn_params.type != SRSN_YANG_PUSH_ON_CHANGE) || !sub->sync_on_start || !receiver->srsn_data.sub_id) {
++        return;
++    }
++
++    /* sent asynchronously by the srsn subscription */
++    if (srsn_yang_push_on_change_resync(receiver->srsn_data.sub_id)) {
++        SRNTF_LOG_WRN("Failed to resync receiver \"%s\" of subscription %" PRIu32 ".", receiver->name, sub->id);
++    }
++}
++
+ int
+ notif_receiver_backoff_reconnect(notifd_ctx_t *notifd_ctx, notif_receiver_t *receiver)
+ {
+@@ -570,6 +606,9 @@ notif_receiver_backoff_reconnect(notifd_ctx_t *notifd_ctx, notif_receiver_t *rec
+ 
+     receiver->state = NOTIF_RECV_STATE_ACTIVE;
+ 
++    /* an on-change subscription with sync-on-start starts with a push-update */
++    notif_receiver_sync_on_start(receiver);
++
+     return SR_ERR_OK;
+ 
+ disconnect:
+@@ -785,6 +824,9 @@ notif_receiver_reconnect(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, notif_recei
+     receiver->reconnect_attempts = 0;
+     memset(&receiver->last_reconnect_attempt, 0, sizeof receiver->last_reconnect_attempt);
+ 
++    /* an on-change subscription with sync-on-start starts with a push-update */
++    notif_receiver_sync_on_start(receiver);
++
+ cleanup:
+     if (rc) {
+         /* disconnect the receiver */
+diff --git a/src/executables/sysrepo-notifd/sysrepo-notifd.8 b/src/executables/sysrepo-notifd/sysrepo-notifd.8
+index 879a311c..d56539d0 100644
+--- a/src/executables/sysrepo-notifd/sysrepo-notifd.8
++++ b/src/executables/sysrepo-notifd/sysrepo-notifd.8
+@@ -3,7 +3,7 @@
+ .\" groff -man -Tascii sysrepo-notifd.8
+ .\"
+ 
+-.TH SYSREPO-NOTIFD 8 "2026-05-29" "sysrepo"
++.TH SYSREPO-NOTIFD 8 "2026-10-09" "sysrepo"
+ .SH NAME
+ sysrepo-notifd \- sysrepo notification daemon
+ .
+@@ -17,11 +17,15 @@ sysrepo-notifd \- sysrepo notification daemon
+ It reads the \fIietf-subscribed-notifications\fP configuration and manages the
+ lifecycle of subscriptions and their receivers, delivering notifications from
+ filterable event streams over configurable transports (UDP out of the box).
+-With \fIietf-yang-push\fP installed, it also implements RFC 8641 configured
+-datastore subscriptions.
+ On startup it requires these three modules to be installed:
+ \fIietf-subscribed-notifications\fP, \fIietf-subscribed-notif-receivers\fP
+ and \fIietf-udp-notif-transport\fP.
++With the optional \fIietf-yang-push\fP installed, it also implements RFC 8641
++configured datastore subscriptions, periodic and on-change, the latter only
++with its feature \fIon-change\fP enabled.
++The \fIrunning\fP, \fIstartup\fP, \fIcandidate\fP, \fIoperational\fP and
++\fIfactory-default\fP datastores can be subscribed to, \fIfactory-default\fP
++only periodically.
+ .
+ .SH OPTIONS
+ .TP
+diff --git a/tests/notifd/test_notifd_yang_push.c b/tests/notifd/test_notifd_yang_push.c
+index bf8d0d10..1189a0c3 100644
+--- a/tests/notifd/test_notifd_yang_push.c
++++ b/tests/notifd/test_notifd_yang_push.c
+@@ -21,6 +21,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ #include <cmocka.h>
+ #include <libyang/libyang.h>
+@@ -224,6 +225,15 @@ test_yp_validation(void **state)
+             "ietf-yang-push:datastore-subtree-filter", NULL, NULL);
+     apply_rejected(st, SR_ERR_UNSUPPORTED);
+ 
++    /* no changes of factory-default to subscribe to */
++    stage_ds_sub(st, 505, "ietf-yang-push:on-change/dampening-period", "0", NULL);
++    set_node(st, "ietf-factory-default:factory-default", SUB_XP "/ietf-yang-push:datastore", 505);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* a dampening period that does not fit in milliseconds */
++    stage_ds_sub(st, 505, "ietf-yang-push:on-change/dampening-period", "500000000", NULL);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
+     /* the same for named selection filters */
+     add_selection_filter(st, "bad", "/test:no-such-leaf");
+     apply_rejected(st, SR_ERR_VALIDATION_FAILED);
+@@ -252,6 +262,213 @@ test_yp_validation(void **state)
+     skip_notif(st, PUSH_UPDATE);
+ }
+ 
++/**
++ * @brief Wait for notifications until every one of the strings was included in one, skipping the others.
++ *
++ * @param[in] st Test state.
++ * @param[in] path Path of the notifications to look at.
++ * @param[in] strs NULL-terminated strings, each must be included in a notification.
++ */
++static void
++expect_notifs_having(struct tnotifd_state *st, const char *path, const char **strs)
++{
++    struct lyd_node *notif;
++    uint32_t i, count, found = 0;
++    uint8_t seen[8] = {0};
++
++    for (count = 0; strs[count]; ++count) {}
++    while (found < count) {
++        notif = expect_notif(st, path);
++        for (i = 0; i < count; ++i) {
++            if (!seen[i] && notif_has(notif, strs[i])) {
++                seen[i] = 1;
++                ++found;
++            }
++        }
++        lyd_free_all(notif);
++    }
++}
++
++/**
++ * @brief Test: an on-change subscription starts with a push-update and reports the changes.
++ */
++static void
++test_yp_on_change(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    set_node(st, "1", "/test:test-leaf");
++    apply_changes(st);
++
++    setup_ds_sub(st, 510, "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf",
++            "ietf-yang-push:on-change/dampening-period", "0", NULL);
++
++    notif = expect_notif(st, SUB_STARTED);
++    assert_notif_leaf(notif, "ietf-yang-push:datastore", DS_RUNNING);
++    assert_notif_leaf(notif, "ietf-yang-push:on-change/dampening-period", "0");
++    assert_notif_leaf(notif, "ietf-yang-push:on-change/sync-on-start", "true");
++    lyd_free_all(notif);
++
++    /* sync-on-start */
++    notif = expect_notif(st, PUSH_UPDATE);
++    assert_notif_leaf(notif, "id", "510");
++    assert_true(notif_has(notif, "<test-leaf xmlns=\"urn:test\">1</test-leaf>"));
++    lyd_free_all(notif);
++
++    /* a change, with the configured subscription ID */
++    set_node(st, "2", "/test:test-leaf");
++    apply_changes(st);
++    notif = expect_notif(st, PUSH_CHANGE_UPDATE);
++    assert_notif_leaf(notif, "id", "510");
++    assert_true(notif_has(notif, "<operation>replace</operation><target>/test:test-leaf</target>"));
++    lyd_free_all(notif);
++}
++
++/**
++ * @brief Test: the excluded changes are not reported, but counted.
++ */
++static void
++test_yp_on_change_excluded(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    setup_ds_sub(st, 511, "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf",
++            "ietf-yang-push:on-change/sync-on-start", "false",
++            "ietf-yang-push:on-change/excluded-change", "replace", NULL);
++
++    notif = expect_notif(st, SUB_STARTED);
++    assert_notif_leaf(notif, "ietf-yang-push:on-change/sync-on-start", "false");
++    assert_notif_leaf(notif, "ietf-yang-push:on-change/excluded-change[.='replace']", "replace");
++    lyd_free_all(notif);
++
++    set_node(st, "1", "/test:test-leaf");
++    apply_changes(st);
++    notif = expect_notif(st, PUSH_CHANGE_UPDATE);
++    assert_true(notif_has(notif, "<operation>create</operation>"));
++    lyd_free_all(notif);
++
++    /* the replace is excluded */
++    set_node(st, "2", "/test:test-leaf");
++    apply_changes(st);
++    wait_oper_above(st, 0, RECV_XP "/excluded-event-records", 511, TEST_RECV);
++
++    del_node(st, "/test:test-leaf");
++    apply_changes(st);
++    notif = expect_notif(st, PUSH_CHANGE_UPDATE);
++    assert_true(notif_has(notif, "<operation>delete</operation>"));
++    lyd_free_all(notif);
++
++    /* there was no push-update at all */
++    expect_no_notif(st, PUSH_UPDATE);
++}
++
++/**
++ * @brief Test: an unfiltered on-change subscription of running is created, resubscribed and deleted while the
++ * changes of every module are reported, ietf-subscribed-notifications included.
++ */
++static void
++test_yp_on_change_all(void **state)
++{
++    struct tnotifd_state *st = *state;
++
++    /* apply() asserts success, a stalled apply returns an error */
++    setup_ds_sub(st, 513, "ietf-yang-push:on-change/dampening-period", "0", NULL);
++    skip_notif(st, SUB_STARTED);
++    skip_notif(st, PUSH_UPDATE);
++
++    set_node(st, "1", "/test:test-leaf");
++    apply_changes(st);
++    expect_notifs_having(st, PUSH_CHANGE_UPDATE, (const char *[]) {"<target>/test:test-leaf</target>", NULL});
++
++    /* resubscribed, the new subscription starts with a push-update */
++    set_node(st, "1", SUB_XP "/ietf-yang-push:on-change/dampening-period", 513);
++    apply_changes(st);
++    skip_notif(st, SUB_MODIFIED);
++    skip_notif(st, PUSH_UPDATE);
++
++    /* one apply changing ietf-subscribed-notifications and a covered module */
++    set_node(st, "2", "/test:test-leaf");
++    set_node(st, "all", SUB_XP "/purpose", 513);
++    apply_changes(st);
++    expect_notifs_having(st, PUSH_CHANGE_UPDATE, (const char *[]) {"<target>/test:test-leaf</target>",
++                "/purpose</target>", NULL});
++
++    del_node(st, SUB_XP, 513);
++    apply_changes(st);
++    skip_notif(st, SUB_TERMINATED);
++}
++
++/**
++ * @brief Test: a modified subscription is sent subscription-modified followed by a push-update on every active
++ * receiver, also when switched from periodic to on-change.
++ */
++static void
++test_yp_on_change_modify(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++    uint16_t recv2_port = 0;
++    int recv2_sockfd;
++
++    recv2_sockfd = create_udp_receiver_socket(&recv2_port);
++    assert_true(recv2_sockfd >= 0);
++
++    set_node(st, "3", "/test:test-leaf");
++    set_node(st, "4", "/test:cont/l2[k='a']/v");
++    add_recv_inst(st, "test-recv2", recv2_port, NULL);
++    stage_ds_sub(st, 514, "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf",
++            "ietf-yang-push:periodic/period", "1000", NULL);
++    bind_sub_recv(st, 514, "recv2", "test-recv2");
++    apply_changes(st);
++    skip_notif(st, SUB_STARTED);
++    lyd_free_all(expect_notif_on(st, recv2_sockfd, SUB_STARTED));
++
++    /* switched to on-change with another filter */
++    del_node(st, SUB_XP "/ietf-yang-push:periodic", 514);
++    set_node(st, "0", SUB_XP "/ietf-yang-push:on-change/dampening-period", 514);
++    set_node(st, "/test:cont", SUB_XP "/ietf-yang-push:datastore-xpath-filter", 514);
++    apply_changes(st);
++
++    notif = expect_notif(st, SUB_MODIFIED);
++    assert_notif_leaf(notif, "ietf-yang-push:on-change/dampening-period", "0");
++    assert_notif_leaf(notif, "ietf-yang-push:datastore-xpath-filter", "/test:cont");
++    lyd_free_all(notif);
++    lyd_free_all(expect_push_update(st, "<l2><k>a</k><v>4</v></l2>"));
++
++    lyd_free_all(expect_notif_on(st, recv2_sockfd, SUB_MODIFIED));
++    notif = expect_notif_on(st, recv2_sockfd, PUSH_UPDATE);
++    assert_true(notif_has(notif, "<l2><k>a</k><v>4</v></l2>"));
++    lyd_free_all(notif);
++
++    /* and the changes follow on both */
++    set_node(st, "5", "/test:cont/l2[k='a']/v");
++    apply_changes(st);
++    lyd_free_all(expect_notif(st, PUSH_CHANGE_UPDATE));
++    lyd_free_all(expect_notif_on(st, recv2_sockfd, PUSH_CHANGE_UPDATE));
++
++    close(recv2_sockfd);
++}
++
++/**
++ * @brief Test: a receiver reset starts it over with subscription-started and a push-update.
++ */
++static void
++test_yp_on_change_reset(void **state)
++{
++    struct tnotifd_state *st = *state;
++
++    setup_ds_sub(st, 515, "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf",
++            "ietf-yang-push:on-change/dampening-period", "0", NULL);
++    skip_notif(st, SUB_STARTED);
++    skip_notif(st, PUSH_UPDATE);
++
++    send_reset(st, 515, TEST_RECV);
++    skip_notif(st, SUB_STARTED);
++    skip_notif(st, PUSH_UPDATE);
++}
++
+ /* MAIN */
+ int
+ main(void)
+@@ -261,6 +478,11 @@ main(void)
+         cmocka_unit_test_setup(test_yp_selection_filter, tnotifd_reset),
+         cmocka_unit_test_setup(test_yp_stream_to_datastore, tnotifd_reset),
+         cmocka_unit_test_setup(test_yp_validation, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_on_change, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_on_change_excluded, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_on_change_all, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_on_change_modify, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_on_change_reset, tnotifd_reset),
+     };
+ 
+     setenv("CMOCKA_TEST_ABORT", "1", 1);
+diff --git a/tests/notifd/tnotifd.h b/tests/notifd/tnotifd.h
+index 7c84cbca..fd118768 100644
+--- a/tests/notifd/tnotifd.h
++++ b/tests/notifd/tnotifd.h
+@@ -175,7 +175,7 @@ typedef struct {
+  *   221      restart              230      receiver inst ref    300      resolve failure
+  *   305      large notification   307      sent records         309      sigterm shutdown
+  *   310      excluded records
+- *   500-509  yang-push periodic
++ *   500-509  yang-push periodic    510-519  yang-push on-change
+  */
+ 
+ /**

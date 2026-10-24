@@ -1,0 +1,189 @@
+From c9d2fc308a8eafce79eea07fad7c10ebc16def72 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Wed, 14 Oct 2026 13:26:50 +0200
+Subject: [PATCH] examples UPDATE notifd yang-push subscriptions
+
+The notifd client prints yang-push notifications as they are, only its
+README described stream subscriptions alone.
+
+Add periodic and on-change subscription examples with the interfaces
+data they push, list the yang-push modules among the prerequisites and
+drop the list of other subscription options, the YANG models describe
+them. Also fix the name of notif_send_example.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/6f73e02a2f3f78277f8b14801172a27248ee998e
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ examples/notifd/README.md                | 52 ++++++++++++++++++++----
+ examples/notifd/example_interfaces.xml   |  7 ++++
+ examples/notifd/example_yp_on_change.xml | 28 +++++++++++++
+ examples/notifd/example_yp_periodic.xml  | 29 +++++++++++++
+ 4 files changed, 107 insertions(+), 9 deletions(-)
+ create mode 100644 examples/notifd/example_interfaces.xml
+ create mode 100644 examples/notifd/example_yp_on_change.xml
+ create mode 100644 examples/notifd/example_yp_periodic.xml
+
+diff --git a/examples/notifd/README.md b/examples/notifd/README.md
+index 6dfa4304..8e8bf725 100644
+--- a/examples/notifd/README.md
++++ b/examples/notifd/README.md
+@@ -83,14 +83,14 @@ This creates:
+ 
+ Once applied, sysrepo-notifd will send a `subscription-started`
+ notification to the client, followed by any NETCONF stream events.
+-You can use the `notifd_send_example` binary to trigger test
++You can use the `notif_send_example` binary to trigger test
+ notifications and verify they arrive at the client.
+ 
+ To terminate the configured subscription, you can just delete it
+ from the datastore. For example using `sysrepocfg`:
+ 
+ ```bash
+-$ echo '<subscriptions xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"/>' | ./sysrepocfg -I --
++$ echo '<subscriptions xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"/>' | sysrepocfg -I --
+ ```
+ 
+ ### Adding an XPath filter
+@@ -104,13 +104,40 @@ XPath filter to the subscription:
+ 
+ Place this inside the `<subscription>` element.
+ 
+-### Additional subscription options
++### Example: YANG Push subscriptions
+ 
+-Other configurable leaves include `stop-time`, `configured-replay`,
+-`encoding`, `purpose`, `source-address`, `stream-filter-name`, and
+-`stream-subtree-filter`. You can find more about these in the
+-relevant YANG models (`ietf-subscribed-notifications`,
+-`ietf-subscribed-notif-receivers`).
++Instead of a stream, a subscription can select data of a datastore
++and push it to the receiver (RFC 8641). The examples below push the
++interfaces of the running datastore, so load some first:
++
++```bash
++$ sysrepocfg -E ../examples/notifd/example_interfaces.xml -m ietf-interfaces
++```
++
++A periodic subscription, `example_yp_periodic.xml`, sends the data
++every 5 seconds:
++
++```bash
++$ sysrepocfg -E ../examples/notifd/example_yp_periodic.xml -m ietf-subscribed-notifications
++```
++
++The client receives `subscription-started` followed by a `push-update`
++with the selected data every period.
++
++An on-change subscription, `example_yp_on_change.xml`, sends the data
++once when it starts and then every change of it:
++
++```bash
++$ sysrepocfg -E ../examples/notifd/example_yp_on_change.xml -m ietf-subscribed-notifications
++```
++
++The client receives `subscription-started` and a `push-update`, then a
++`push-change-update` with a YANG patch for every edit of the data, for
++example after changing the interface description with:
++
++```bash
++$ sysrepocfg -E vim -m ietf-interfaces
++```
+ 
+ ### Prerequisites
+ 
+@@ -121,5 +148,12 @@ following YANG modules are installed in sysrepo:
+ - `ietf-subscribed-notifications` (with features: `configured`, `xpath`, `replay`, `subtree`)
+ - `ietf-subscribed-notif-receivers`
+ - `ietf-udp-notif-transport`
++- `ietf-yang-push` (with feature: `on-change`) and `ietf-yang-patch`, for YANG Push
++
++Use `sysrepoctl` to install them if needed. The interfaces of the
++YANG Push examples also need `iana-if-type`, which is not installed
++with sysrepo:
+ 
+-Use `sysrepoctl` to install them if needed.
++```bash
++$ sysrepoctl -i ../modules/subscribed_notifications/iana-if-type@2014-05-08.yang
++```
+diff --git a/examples/notifd/example_interfaces.xml b/examples/notifd/example_interfaces.xml
+new file mode 100644
+index 00000000..934c11d2
+--- /dev/null
++++ b/examples/notifd/example_interfaces.xml
+@@ -0,0 +1,7 @@
++<interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces">
++  <interface>
++    <name>eth0</name>
++    <type xmlns:ianaift="urn:ietf:params:xml:ns:yang:iana-if-type">ianaift:ethernetCsmacd</type>
++    <description>first</description>
++  </interface>
++</interfaces>
+diff --git a/examples/notifd/example_yp_on_change.xml b/examples/notifd/example_yp_on_change.xml
+new file mode 100644
+index 00000000..14ea7a25
+--- /dev/null
++++ b/examples/notifd/example_yp_on_change.xml
+@@ -0,0 +1,28 @@
++<subscriptions xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications">
++  <receiver-instances xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notif-receivers">
++    <receiver-instance>
++      <name>my-udp-receiver</name>
++      <udp-notif-receiver xmlns="urn:ietf:params:xml:ns:yang:ietf-udp-notif-transport">
++        <remote-address>127.0.0.1</remote-address>
++        <remote-port>47950</remote-port>
++        <enable-segmentation>true</enable-segmentation>
++        <max-segment-size>1400</max-segment-size>
++      </udp-notif-receiver>
++    </receiver-instance>
++  </receiver-instances>
++  <subscription>
++    <id>11</id>
++    <datastore xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push" xmlns:ds="urn:ietf:params:xml:ns:yang:ietf-datastores">ds:running</datastore>
++    <datastore-xpath-filter xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push" xmlns:if="urn:ietf:params:xml:ns:yang:ietf-interfaces">/if:interfaces</datastore-xpath-filter>
++    <on-change xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push">
++      <dampening-period>0</dampening-period>
++    </on-change>
++    <transport xmlns:unt="urn:ietf:params:xml:ns:yang:ietf-udp-notif-transport">unt:udp-notif</transport>
++    <receivers>
++      <receiver>
++        <name>recv1</name>
++        <receiver-instance-ref xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notif-receivers">my-udp-receiver</receiver-instance-ref>
++      </receiver>
++    </receivers>
++  </subscription>
++</subscriptions>
+diff --git a/examples/notifd/example_yp_periodic.xml b/examples/notifd/example_yp_periodic.xml
+new file mode 100644
+index 00000000..a9189a55
+--- /dev/null
++++ b/examples/notifd/example_yp_periodic.xml
+@@ -0,0 +1,29 @@
++<subscriptions xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications">
++  <receiver-instances xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notif-receivers">
++    <receiver-instance>
++      <name>my-udp-receiver</name>
++      <udp-notif-receiver xmlns="urn:ietf:params:xml:ns:yang:ietf-udp-notif-transport">
++        <remote-address>127.0.0.1</remote-address>
++        <remote-port>47950</remote-port>
++        <enable-segmentation>true</enable-segmentation>
++        <max-segment-size>1400</max-segment-size>
++      </udp-notif-receiver>
++    </receiver-instance>
++  </receiver-instances>
++  <subscription>
++    <id>10</id>
++    <datastore xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push" xmlns:ds="urn:ietf:params:xml:ns:yang:ietf-datastores">ds:running</datastore>
++    <datastore-xpath-filter xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push" xmlns:if="urn:ietf:params:xml:ns:yang:ietf-interfaces">/if:interfaces</datastore-xpath-filter>
++    <periodic xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push">
++      <!-- in centiseconds, 5 seconds -->
++      <period>500</period>
++    </periodic>
++    <transport xmlns:unt="urn:ietf:params:xml:ns:yang:ietf-udp-notif-transport">unt:udp-notif</transport>
++    <receivers>
++      <receiver>
++        <name>recv1</name>
++        <receiver-instance-ref xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notif-receivers">my-udp-receiver</receiver-instance-ref>
++      </receiver>
++    </receivers>
++  </subscription>
++</subscriptions>

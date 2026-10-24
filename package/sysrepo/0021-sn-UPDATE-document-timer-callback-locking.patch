@@ -1,0 +1,52 @@
+From 96c9972e8802f5e5de619196428f79dc7548cdbc Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Fri, 16 Oct 2026 09:53:30 +0200
+Subject: [PATCH] sn UPDATE document timer callback locking
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/e984c2d394413c2bc507a3fee6ab8621f432b9ab
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.h    | 4 ++--
+ src/utils/sn_yang_push.c | 4 +++-
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index 98a95fc1..5128785b 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -272,11 +272,11 @@ struct timespec srsn_time_add_ms(const struct timespec *ts, int64_t ms);
+ /**
+  * @brief Create a new SRSN timer.
+  *
+- * @param[in] cb Callback to call on a trigger.
++ * @param[in] cb Callback to call on a trigger, called with the @p sntimer lock held.
+  * @param[in] arg Argument to pass @p cb.
+  * @param[in] trigger Timer trigger.
+  * @param[in] interval Optional timer interval.
+- * @param[out] sntimer Created timer.
++ * @param[in,out] sntimer Timer to start, its lock and cond must be initialized.
+  * @return err_info, NULL on success.
+  */
+ sr_error_info_t *srsn_create_timer(void (*cb)(void *arg, int *freed), void *arg, const struct timespec *trigger,
+diff --git a/src/utils/sn_yang_push.c b/src/utils/sn_yang_push.c
+index a28aeea2..c23199c0 100644
+--- a/src/utils/sn_yang_push.c
++++ b/src/utils/sn_yang_push.c
+@@ -256,6 +256,8 @@ cleanup:
+ /**
+  * @brief Send a prepared yang-push on-change change notification.
+  *
++ * @warning The caller MUST hold the dampening timer lock.
++ *
+  * @param[in] sub Subscription to use.
+  * @return err_info, NULL on success.
+  */
+@@ -287,7 +289,7 @@ srsn_yp_damp_timer_cb(void *arg, int *UNUSED(freed))
+     struct srsn_sub *sub = arg;
+     sr_error_info_t *err_info = NULL;
+ 
+-    /* send the postponed on-change notification, unless a resync dropped it */
++    /* the timer thread holds the dampening timer lock, send the postponed notification unless a resync dropped it */
+     if (sub->change_ntf && (err_info = srsn_yp_ntf_change_send(sub))) {
+         sr_errinfo_free(&err_info);
+     }

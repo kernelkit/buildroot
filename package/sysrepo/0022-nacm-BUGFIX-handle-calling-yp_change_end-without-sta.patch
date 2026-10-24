@@ -1,0 +1,28 @@
+From a440c2516925f59c003b75c1ff0d28ea40bb6251 Mon Sep 17 00:00:00 2001
+From: Michal Vasko <mvasko@cesnet.cz>
+Date: Fri, 16 Oct 2026 10:26:38 +0200
+Subject: [PATCH] nacm BUGFIX handle calling yp_change_end without start
+
+Fixes #3818
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/cfc6169ddc04bdb105aba4d9ba90903d1d14fd4d
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/nacm.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/utils/nacm.c b/src/utils/nacm.c
+index c1df816d..d148cf24 100644
+--- a/src/utils/nacm.c
++++ b/src/utils/nacm.c
+@@ -2435,6 +2435,10 @@ cleanup:
+ void
+ sr_nacm_check_yp_change_end(char **groups, uint32_t group_count)
+ {
++    if (!groups) {
++        return;
++    }
++
+     /* NACM UNLOCK */
+     pthread_mutex_unlock(&nacm.lock);
+ 

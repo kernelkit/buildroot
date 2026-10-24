@@ -1,0 +1,111 @@
+From 53fc4cc749f17ce225517553a3368b72a42f839c Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:52:07 +0200
+Subject: [PATCH] notifd BUGFIX configured-replay on creation
+
+configured-replay was only handled as a modification of an existing
+subscription. A subscription created with it never parsed the leaf, so
+it was started without a replay start time and replayed nothing.
+
+The target parser now sets the replay and its start time.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/28a715d914c660365ee019bac76a6e6e7a7d83e5
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ .../sysrepo-notifd/notifd_config.c            | 13 ++++++++
+ tests/notifd/test_notifd_lifecycle.c          | 31 ++++++++++++++++++-
+ tests/notifd/tnotifd.h                        |  1 +
+ 3 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/src/executables/sysrepo-notifd/notifd_config.c b/src/executables/sysrepo-notifd/notifd_config.c
+index 523517f8..6c035ef0 100644
+--- a/src/executables/sysrepo-notifd/notifd_config.c
++++ b/src/executables/sysrepo-notifd/notifd_config.c
+@@ -1126,6 +1126,8 @@ subscription_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const
+     sub->filter_ref = NULL;
+     free(sub->srsn_params.xpath_filter);
+     sub->srsn_params.xpath_filter = NULL;
++    sub->replay = 0;
++    memset(&sub->srsn_params.start_time, 0, sizeof sub->srsn_params.start_time);
+ 
+     /* stream */
+     if ((rc = get_descendant_mandatory(sub_node, "stream", &n))) {
+@@ -1167,6 +1169,17 @@ subscription_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const
+         CHECK_ERRMEM_GOTO(sub->srsn_params.xpath_filter, rc, cleanup);
+     }
+ 
++    /* configured-replay, from the earliest notification the stream can replay */
++    get_descendant_optional(sub_node, "configured-replay", &n);
++    if (n) {
++        if ((rc = stream_supports_replay(notifd_ctx, sub->srsn_params.stream, sub->srsn_params.xpath_filter, &sub->srsn_params.start_time))) {
++            SRNTF_LOG_ERR("Stream \"%s\" does not support replay, cannot enable replay for subscription ID %" PRIu32 ".",
++                    sub->srsn_params.stream, sub->id);
++            goto cleanup;
++        }
++        sub->replay = 1;
++    }
++
+ cleanup:
+     return rc;
+ }
+diff --git a/tests/notifd/test_notifd_lifecycle.c b/tests/notifd/test_notifd_lifecycle.c
+index 4852d13e..fd43dbde 100644
+--- a/tests/notifd/test_notifd_lifecycle.c
++++ b/tests/notifd/test_notifd_lifecycle.c
+@@ -329,7 +329,35 @@ test_configured_replay(void **state)
+ }
+ 
+ /**
+- * @brief Teardown: disable the replay support enabled by test_configured_replay.
++ * @brief Test: configured-replay set together with the subscription replays the stored notifications.
++ */
++static void
++test_configured_replay_on_create(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    assert_int_equal(sr_set_module_replay_support(st->conn, "ietf-netconf-notifications", 1), SR_ERR_OK);
++
++    /* a config change stored for replay before the subscription exists */
++    set_node(st, "95", "/test:test-leaf");
++    apply_changes(st);
++
++    setup_sub(st, 95, "stream-xpath-filter", NCC, "configured-replay", NULL, NULL);
++
++    notif = expect_notif(st, SUB_STARTED);
++    assert_int_equal(lyd_find_path(notif, "replay-start-time", 0, NULL), LY_SUCCESS);
++    lyd_free_all(notif);
++
++    /* the stored change is replayed, followed by the end of the replay */
++    skip_notif(st, NCC);
++    notif = expect_notif(st, REPLAY_COMPLETED);
++    assert_notif_leaf(notif, "id", "95");
++    lyd_free_all(notif);
++}
++
++/**
++ * @brief Teardown: disable the replay support enabled by the replay tests.
+  */
+ static int
+ disable_replay_support(void **state)
+@@ -581,6 +609,7 @@ main(void)
+         cmocka_unit_test_setup(test_message_id_increment, tnotifd_reset),
+         cmocka_unit_test_setup(test_no_config_change_on_start, tnotifd_reset),
+         cmocka_unit_test_setup_teardown(test_configured_replay, tnotifd_reset, disable_replay_support),
++        cmocka_unit_test_setup_teardown(test_configured_replay_on_create, tnotifd_reset, disable_replay_support),
+         cmocka_unit_test_setup(test_restart_existing_config, tnotifd_reset),
+         cmocka_unit_test_setup_teardown(test_other_publisher, tnotifd_reset, unsubscribe_test_subscr),
+         cmocka_unit_test_setup(test_stop_time_concluded, tnotifd_reset),
+diff --git a/tests/notifd/tnotifd.h b/tests/notifd/tnotifd.h
+index c9b41686..706a173f 100644
+--- a/tests/notifd/tnotifd.h
++++ b/tests/notifd/tnotifd.h
+@@ -161,6 +161,7 @@ typedef struct {
+  *   11-13    multiple             40       message_id           50-52    xpath filters
+  *   60,62    subtree filters      70-76    filter refs          90,91    oper data
+  *   92       source_address       93       configured_replay    94       receiver_reset
++ *   95       replay on create
+  *   100-102  started fields       110-114  encodings            130,131  segmentation
+  *   200,201  stop_time            210,211  receiver churn       220      receiver delete
+  *   221      restart              230      receiver inst ref    300      resolve failure

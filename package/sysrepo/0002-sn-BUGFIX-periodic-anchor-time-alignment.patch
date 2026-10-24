@@ -1,0 +1,180 @@
+From 20f34d416e4adf34edb899c56a49e5e86165b0e1 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:17:05 +0200
+Subject: [PATCH] sn BUGFIX periodic anchor-time alignment
+
+The first trigger was computed with sr_time_sub_ms(), which returns -1
+for any negative difference and overflows after ~24.8 days. A future
+anchor therefore fired after 1 ms and a past one at now + d % period
+instead of now + period - d % period.
+
+The first trigger is now computed in 64-bit milliseconds, which cannot
+overflow for any date-and-time anchor in either direction. A periodic
+timer re-arms one interval after its previous trigger, skipping the
+periods already over, instead of one interval after its callback
+ended, so it no longer drifts by the callback duration. srsn_resume()
+passes the anchor only if it is set.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/77e1907340c9082a94e41f281ce0491dbbfa8e94
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c                | 52 ++++++++++++++++++++++------
+ src/utils/sn_common.h                | 18 ++++++++++
+ src/utils/sn_yang_push.c             | 17 +++++----
+ src/utils/subscribed_notifications.c |  3 +-
+ 4 files changed, 72 insertions(+), 18 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index 73006174..b7a98390 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -589,6 +589,32 @@ cleanup:
+     return err_info;
+ }
+ 
++int64_t
++srsn_time_diff_ms(const struct timespec *ts1, const struct timespec *ts2)
++{
++    return ((int64_t)ts1->tv_sec - ts2->tv_sec) * 1000 + (ts1->tv_nsec - ts2->tv_nsec) / 1000000;
++}
++
++struct timespec
++srsn_time_add_ms(const struct timespec *ts, int64_t ms)
++{
++    struct timespec ret;
++    int64_t nsec;
++
++    ret.tv_sec = ts->tv_sec + ms / 1000;
++    nsec = ts->tv_nsec + (ms % 1000) * 1000000;
++    if (nsec < 0) {
++        nsec += 1000000000;
++        --ret.tv_sec;
++    } else if (nsec >= 1000000000) {
++        nsec -= 1000000000;
++        ++ret.tv_sec;
++    }
++    ret.tv_nsec = nsec;
++
++    return ret;
++}
++
+ /**
+  * @brief Timer thread function.
+  */
+@@ -596,9 +622,9 @@ static void *
+ srsn_timer_thread(void *arg)
+ {
+     struct srsn_timer *sntimer = arg;
+-    struct timespec trigger;
++    struct timespec trigger, now;
+     int r, freed = 0;
+-    uint32_t interval_ms;
++    int64_t interval_ms, diff_ms, periods;
+ 
+     /* TIMER LOCK */
+     pthread_mutex_lock(&sntimer->lock);
+@@ -627,14 +653,20 @@ wait:
+ 
+     /* prepare the next trigger after the callback */
+     if (sntimer->interval.tv_sec || sntimer->interval.tv_nsec) {
+-        /* update the trigger to the current time */
+-        sr_realtime_get(&sntimer->trigger);
+-
+-        interval_ms = sntimer->interval.tv_sec * 1000;
+-        interval_ms += sntimer->interval.tv_nsec / 1000000;
+-
+-        /* add the interval */
+-        sntimer->trigger = sr_time_ts_add(&sntimer->trigger, interval_ms);
++        interval_ms = (int64_t)sntimer->interval.tv_sec * 1000 + sntimer->interval.tv_nsec / 1000000;
++        assert(interval_ms > 0);
++
++        /* time since the previous trigger */
++        sr_realtime_get(&now);
++        diff_ms = srsn_time_diff_ms(&now, &sntimer->trigger);
++        if (diff_ms > 0) {
++            /* skip the periods that are already over */
++            periods = diff_ms / interval_ms + 1;
++        } else {
++            /* the clock went back, keep the next period */
++            periods = 1;
++        }
++        sntimer->trigger = srsn_time_add_ms(&sntimer->trigger, periods * interval_ms);
+ 
+         /* wait until the next trigger */
+         goto wait;
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index 888fa520..466083df 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -241,6 +241,24 @@ struct srsn_sub *srsn_find(uint32_t sub_id);
+  */
+ sr_error_info_t *srsn_ntf_send(struct srsn_sub *sub, const struct timespec *timestamp, const struct lyd_node *ly_ntf);
+ 
++/**
++ * @brief Get the difference of two timestamps.
++ *
++ * @param[in] ts1 Timestamp to subtract from.
++ * @param[in] ts2 Timestamp to subtract.
++ * @return @p ts1 - @p ts2 in milliseconds, negative if @p ts2 is later.
++ */
++int64_t srsn_time_diff_ms(const struct timespec *ts1, const struct timespec *ts2);
++
++/**
++ * @brief Add milliseconds to a timestamp.
++ *
++ * @param[in] ts Timestamp to add to.
++ * @param[in] ms Milliseconds to add, may be negative.
++ * @return Resulting timestamp.
++ */
++struct timespec srsn_time_add_ms(const struct timespec *ts, int64_t ms);
++
+ /**
+  * @brief Create a new SRSN timer.
+  *
+diff --git a/src/utils/sn_yang_push.c b/src/utils/sn_yang_push.c
+index cb46855c..a2e740b2 100644
+--- a/src/utils/sn_yang_push.c
++++ b/src/utils/sn_yang_push.c
+@@ -120,18 +120,21 @@ srsn_yp_schedule_periodic_update(uint32_t period_ms, const struct timespec *anch
+ {
+     sr_error_info_t *err_info = NULL;
+     struct timespec trigger, interval;
+-    int anchor_ms;
++    int64_t diff_ms, periods;
+ 
+     /* set the trigger timestamp */
+     sr_realtime_get(&trigger);
+     if (anchor_time) {
+-        /* first update at nearest anchor time on period */
+-        anchor_ms = sr_time_sub_ms(&trigger, anchor_time);
+-        if (anchor_ms < 0) {
+-            anchor_ms *= -1;
++        /* time since the anchor */
++        diff_ms = srsn_time_diff_ms(&trigger, anchor_time);
++        if (diff_ms > 0) {
++            /* the anchor is in the past, round up to the next period */
++            periods = (diff_ms + period_ms - 1) / period_ms;
++        } else {
++            /* the anchor is in the future, the earliest period from now */
++            periods = diff_ms / period_ms;
+         }
+-        anchor_ms %= period_ms;
+-        trigger = sr_time_ts_add(&trigger, anchor_ms);
++        trigger = srsn_time_add_ms(anchor_time, periods * period_ms);
+     }
+ 
+     /* set the interval */
+diff --git a/src/utils/subscribed_notifications.c b/src/utils/subscribed_notifications.c
+index 6299c499..b03648b8 100644
+--- a/src/utils/subscribed_notifications.c
++++ b/src/utils/subscribed_notifications.c
+@@ -726,7 +726,8 @@ srsn_resume(uint32_t sub_id)
+         }
+ 
+         /* create the update timer */
+-        if ((err_info = srsn_yp_schedule_periodic_update(sub->period_ms, &sub->anchor_time, sub, &sub->update_sntimer))) {
++        if ((err_info = srsn_yp_schedule_periodic_update(sub->period_ms,
++                sub->anchor_time.tv_sec ? &sub->anchor_time : NULL, sub, &sub->update_sntimer))) {
+             goto cleanup;
+         }
+         sub->suspended = 0;

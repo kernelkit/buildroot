@@ -1,0 +1,174 @@
+From f1b3d2e52ca572fb0f3f81be4ca4a40a27e3a08f Mon Sep 17 00:00:00 2001
+From: Michal Vasko <mvasko@cesnet.cz>
+Date: Thu, 15 Oct 2026 15:18:35 +0200
+Subject: [PATCH] sysrepo UPDATE flag for last-modif of config data
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/97bfcb1200ccad9b0b9f19511ace72db465d3334
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ ...025-04-04.yang => sysrepo@2026-10-15.yang} | 11 +++
+ src/ly_wrap.c                                 |  2 +-
+ src/sysrepo.c                                 | 70 ++++++++++++++++++-
+ src/sysrepo_types.h                           |  8 ++-
+ 4 files changed, 85 insertions(+), 6 deletions(-)
+ rename modules/{sysrepo@2025-04-04.yang => sysrepo@2026-10-15.yang} (96%)
+
+diff --git a/modules/sysrepo@2025-04-04.yang b/modules/sysrepo@2026-10-15.yang
+similarity index 96%
+rename from modules/sysrepo@2025-04-04.yang
+rename to modules/sysrepo@2026-10-15.yang
+index 75b58446..ba7e409c 100644
+--- a/modules/sysrepo@2025-04-04.yang
++++ b/modules/sysrepo@2026-10-15.yang
+@@ -27,6 +27,11 @@ module sysrepo {
+     description
+         "Sysrepo YANG datastore internal attributes and information.";
+ 
++    revision "2026-10-15" {
++        description
++            "Added last-modif annotation.";
++    }
++
+     revision "2025-04-04" {
+         description
+             "Added schema mount extension instance metadata.";
+@@ -74,6 +79,12 @@ module sysrepo {
+             "RFC 6241 section 7.2.";
+     }
+ 
++    md:annotation last-modif {
++        type yang:date-and-time;
++        description
++            "The timestamp of the last modification of the specific data node or any of its descendants.";
++    }
++
+     identity notification {
+         base ds:datastore;
+         description
+diff --git a/src/ly_wrap.c b/src/ly_wrap.c
+index f0b6ace0..11abb7c8 100644
+--- a/src/ly_wrap.c
++++ b/src/ly_wrap.c
+@@ -259,7 +259,7 @@ sr_ly_ctx_new(struct ly_ctx **ly_ctx)
+         sr_errinfo_new_ly(&err_info, SR_ERR_LY);
+         goto cleanup;
+     }
+-    if (!ly_ctx_load_module(*ly_ctx, "sysrepo", "2025-04-04", NULL)) {
++    if (!ly_ctx_load_module(*ly_ctx, "sysrepo", "2026-10-15", NULL)) {
+         sr_errinfo_new_ly(&err_info, SR_ERR_LY);
+         goto cleanup;
+     }
+diff --git a/src/sysrepo.c b/src/sysrepo.c
+index e26b8a8f..9a858a55 100644
+--- a/src/sysrepo.c
++++ b/src/sysrepo.c
+@@ -3715,6 +3715,65 @@ cleanup:
+     return err_info;
+ }
+ 
++/**
++ * @brief Add 'last-modif' metadata for all top-level nodes.
++ *
++ * @param[in] data Data to change.
++ * @param[in] mod_info Mod info to use.
++ * @return err_info, NULL on success.
++ */
++static sr_error_info_t *
++sr_get_data_add_last_modif(struct lyd_node *data, const struct sr_mod_info_s *mod_info)
++{
++    sr_error_info_t *err_info = NULL;
++    const struct lys_module *prev_mod = NULL, *ly_mod, *sr_mod;
++    struct sr_mod_info_mod_s *mod;
++    const struct sr_ds_handle_s *ds_handle;
++    struct timespec mtime;
++    char *buf = NULL;
++    uint32_t i;
++
++    sr_mod = ly_ctx_get_module_implemented(sr_yang_ctx.ly_ctx, "sysrepo");
++    assert(sr_mod);
++
++    for ( ; data; data = data->next) {
++        ly_mod = lyd_owner_module(data);
++        if (ly_mod != prev_mod) {
++            free(buf);
++            buf = NULL;
++
++            /* different module, find the mod_info mod */
++            for (i = 0; i < mod_info->mod_count; ++i) {
++                mod = &mod_info->mods[i];
++                if (mod->ly_mod == ly_mod) {
++                    break;
++                }
++            }
++            assert(i < mod_info->mod_count);
++
++            /* get the last modification time */
++            ds_handle = mod->ds_handle[mod_info->ds];
++            if ((err_info = ds_handle->plugin->last_modif_cb(ly_mod, mod_info->ds, ds_handle->plg_data, &mtime))) {
++                goto cleanup;
++            }
++
++            /* print into a string */
++            ly_time_ts2str(&mtime, &buf);
++
++            prev_mod = ly_mod;
++        }
++
++        /* add last-modif metadata */
++        if ((err_info = sr_lyd_new_meta(data, sr_mod, "last-modif", buf))) {
++            goto cleanup;
++        }
++    }
++
++cleanup:
++    free(buf);
++    return err_info;
++}
++
+ API int
+ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, uint32_t timeout_ms,
+         const uint32_t opts, sr_data_t **data)
+@@ -3724,8 +3783,8 @@ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, ui
+     struct ly_set *set = NULL;
+     struct lyd_node *oper_data_crashed = NULL;
+ 
+-    SR_CHECK_ARG_APIRET(!session || !xpath || !data || ((session->ds != SR_DS_OPERATIONAL) && (opts & SR_OPER_MASK)),
+-            session, err_info);
++    SR_CHECK_ARG_APIRET(!session || !xpath || !data || ((session->ds != SR_DS_OPERATIONAL) && (opts & SR_OPER_MASK)) ||
++            ((session->ds == SR_DS_OPERATIONAL) && (opts & SR_GET_WITH_LAST_MODIF)), session, err_info);
+ 
+     if (!timeout_ms) {
+         timeout_ms = SR_OPER_CB_TIMEOUT;
+@@ -3788,6 +3847,13 @@ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, ui
+         mod_info.data = NULL;
+     }
+ 
++    if (opts & SR_GET_WITH_LAST_MODIF) {
++        /* add last-modif metadata */
++        if ((err_info = sr_get_data_add_last_modif((*data)->tree, &mod_info))) {
++            goto cleanup;
++        }
++    }
++
+ cleanup:
+     /* MODULES UNLOCK */
+     sr_shmmod_modinfo_unlock(&mod_info);
+diff --git a/src/sysrepo_types.h b/src/sysrepo_types.h
+index 5e7df71c..e033a79b 100644
+--- a/src/sysrepo_types.h
++++ b/src/sysrepo_types.h
+@@ -330,9 +330,11 @@ typedef enum {
+  * @brief Flags used to override default data get behavior.
+  */
+ typedef enum {
+-    SR_GET_NO_FILTER = 0x010000      /**< Do not apply the filter and return the whole "base" data which the filter
+-                                          would normally be applied on. The filter is used only when deciding what data
+-                                          to retrieve from subscribers and similar optimization cases. */
++    SR_GET_NO_FILTER = 0x010000,        /**< Do not apply the filter and return the whole "base" data which the filter
++                                             would normally be applied on. The filter is used only when deciding what data
++                                             to retrieve from subscribers and similar optimization cases. */
++    SR_GET_WITH_LAST_MODIF = 0x020000   /**< Return configuration data with 'sysrepo:last-modif' metadata for all
++                                             top-level data nodes. */
+ } sr_get_flag_t;
+ 
+ /** @} getdata */

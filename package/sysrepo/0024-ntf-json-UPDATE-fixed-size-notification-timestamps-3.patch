@@ -1,0 +1,153 @@
+From ab708338a0aa82142e0837f4806b6af6838911ea Mon Sep 17 00:00:00 2001
+From: bgermann <bage@debian.org>
+Date: Fri, 16 Oct 2026 11:21:30 +0200
+Subject: [PATCH] ntf json UPDATE fixed-size notification timestamps (#3817)
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/3adb731ed0841d4059e9b1832b9a92f63dbcaae5
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/plugins/common_json.h | 13 +++++++++++++
+ src/plugins/ntf_json.c    | 33 ++++++++++++++++++++++++++-------
+ tests/test_notif.c        |  9 ++++++---
+ 3 files changed, 45 insertions(+), 10 deletions(-)
+
+diff --git a/src/plugins/common_json.h b/src/plugins/common_json.h
+index b382323f..ffe59f64 100644
+--- a/src/plugins/common_json.h
++++ b/src/plugins/common_json.h
+@@ -24,8 +24,21 @@
+ 
+ #include <libyang/libyang.h>
+ 
++#include "compat.h"
+ #include "sysrepo.h"
+ 
++/**
++ * @brief Serialized timespec structure with fixed-size fields.
++ * Ensures portable binary serialization across 32-bit and 64-bit systems,
++ * regardless of time_t size or struct padding.
++ */
++typedef struct _PACKED {
++    int64_t tv_sec; /**< Seconds */
++    int32_t tv_nsec; /**< Nanoseconds */
++} srpjson_timespec_t;
++
++_Static_assert(sizeof(srpjson_timespec_t) == 12, "srpjson_timespec_t size mismatch");
++
+ /** suffix of temporary JSON files */
+ #define SRPJSON_FILE_TMP_SUFFIX ".tmp"
+ 
+diff --git a/src/plugins/ntf_json.c b/src/plugins/ntf_json.c
+index aa91ba2b..7f267bfd 100644
+--- a/src/plugins/ntf_json.c
++++ b/src/plugins/ntf_json.c
+@@ -51,11 +51,16 @@ static sr_error_info_t *
+ srpntf_writev_notif(int fd, const char *notif_json, uint32_t notif_json_len, const struct timespec *notif_ts)
+ {
+     sr_error_info_t *err_info = NULL;
++    srpjson_timespec_t ts_serial;
+     struct iovec iov[3];
+ 
++    /* serialize timespec with fixed-size fields */
++    ts_serial.tv_sec = notif_ts->tv_sec;
++    ts_serial.tv_nsec = notif_ts->tv_nsec;
++
+     /* timestamp */
+-    iov[0].iov_base = (void *)notif_ts;
+-    iov[0].iov_len = sizeof *notif_ts;
++    iov[0].iov_base = &ts_serial;
++    iov[0].iov_len = sizeof ts_serial;
+ 
+     /* notification length */
+     iov[1].iov_base = &notif_json_len;
+@@ -89,9 +94,16 @@ srpntf_writev_notif(int fd, const char *notif_json, uint32_t notif_json_len, con
+ static sr_error_info_t *
+ srpntf_read_ts(int notif_fd, struct timespec *notif_ts)
+ {
+-    memset(notif_ts, 0, sizeof *notif_ts);
++    sr_error_info_t *err_info = NULL;
++    srpjson_timespec_t ts_serial = {0, 0};
+ 
+-    return srpjson_read(srpntf_name, notif_fd, notif_ts, sizeof *notif_ts);
++    if ((err_info = srpjson_read(srpntf_name, notif_fd, &ts_serial, sizeof ts_serial))) {
++        memset(notif_ts, 0, sizeof *notif_ts);
++        return err_info;
++    }
++    notif_ts->tv_sec = ts_serial.tv_sec;
++    notif_ts->tv_nsec = ts_serial.tv_nsec;
++    return NULL;
+ }
+ 
+ /**
+@@ -436,6 +448,7 @@ srpntf_json_enable(const struct lys_module *mod)
+     char *path = NULL;
+     int fd = -1;
+     struct timespec ts;
++    srpjson_timespec_t ts_serial;
+ 
+     /* ensure notif directory exists */
+     if ((err_info = srpntf_ensure_dir(NULL))) {
+@@ -461,7 +474,9 @@ srpntf_json_enable(const struct lys_module *mod)
+ 
+     /* write the current real time */
+     clock_gettime(CLOCK_REALTIME, &ts);
+-    if (write(fd, &ts, sizeof ts) != (ssize_t) sizeof ts) {
++    ts_serial.tv_sec = ts.tv_sec;
++    ts_serial.tv_nsec = ts.tv_nsec;
++    if (write(fd, &ts_serial, sizeof ts_serial) != (ssize_t) sizeof ts_serial) {
+         srplg_log_errinfo(&err_info, srpntf_name, NULL, SR_ERR_SYS, "Writing replay time failed (%s).", strerror(errno));
+         goto cleanup;
+     }
+@@ -771,6 +786,7 @@ srpntf_json_replay_start_get(const struct lys_module *mod, struct timespec *ts)
+     char *path = NULL;
+     int fd = -1;
+     ssize_t r;
++    srpjson_timespec_t ts_serial;
+ 
+     /* create directory in case does not exist */
+     if ((err_info = srpntf_ensure_dir(NULL))) {
+@@ -793,13 +809,16 @@ srpntf_json_replay_start_get(const struct lys_module *mod, struct timespec *ts)
+     }
+ 
+     /* read replay timestamp */
+-    r = read(fd, ts, sizeof *ts);
++    r = read(fd, &ts_serial, sizeof ts_serial);
+     if (r == -1) {
+         srplg_log_errinfo(&err_info, srpntf_name, NULL, SR_ERR_SYS, "Reading \"%s\" failed (%s).", path, strerror(errno));
+         goto cleanup;
+-    } else if (r != (ssize_t) sizeof *ts) {
++    } else if (r != (ssize_t) sizeof ts_serial) {
+         srplg_log_errinfo(&err_info, srpntf_name, NULL, SR_ERR_INTERNAL, "Unexpected replay file size.");
+         goto cleanup;
++    } else {
++        ts->tv_sec = ts_serial.tv_sec;
++        ts->tv_nsec = ts_serial.tv_nsec;
+     }
+ 
+ cleanup:
+diff --git a/tests/test_notif.c b/tests/test_notif.c
+index a3fc3a6f..1f9dc9a3 100644
+--- a/tests/test_notif.c
++++ b/tests/test_notif.c
+@@ -185,15 +185,18 @@ store_notif(int fd, const struct ly_ctx *ly_ctx, const char *notif_xpath, off_t
+     char *notif_json;
+     uint32_t notif_json_len;
+     struct lyd_node *notif;
+-    struct timespec notif_ts = {0};
++    int64_t notif_ts_sec;
++    int32_t notif_ts_nsec;
+ 
+     if (lyd_new_path(NULL, ly_ctx, notif_xpath, NULL, 0, &notif)) {
+         return 1;
+     }
+     lyd_print_mem(&notif_json, notif, LYD_JSON, LYD_PRINT_SIBLINGS | LYD_PRINT_SHRINK);
+     notif_json_len = strlen(notif_json);
+-    notif_ts.tv_sec = start_ts + ts_offset;
+-    assert_int_equal(write(fd, &notif_ts, sizeof notif_ts), sizeof notif_ts);
++    notif_ts_sec = start_ts + ts_offset;
++    notif_ts_nsec = 0;
++    assert_int_equal(write(fd, &notif_ts_sec, sizeof notif_ts_sec), sizeof notif_ts_sec);
++    assert_int_equal(write(fd, &notif_ts_nsec, sizeof notif_ts_nsec), sizeof notif_ts_nsec);
+     assert_int_equal(write(fd, &notif_json_len, sizeof notif_json_len), sizeof notif_json_len);
+     assert_int_equal(write(fd, notif_json, notif_json_len), notif_json_len);
+     lyd_free_all(notif);

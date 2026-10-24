@@ -1,0 +1,372 @@
+From 81dc32905b3dd0d00dc79214d4e2d233bd5bda45 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:37:36 +0200
+Subject: [PATCH] sn BUGFIX terminate without the subscription lock
+
+srsn_terminate() kept the global subscription lock across the teardown,
+which joins the timers and waits for a callback in progress, either of
+which may wait for that very lock or for a pipe reader. A stop timer
+firing at the same time deadlocked: its callback waited for the lock
+while the terminate joined it. An update timer inside sr_get_data()
+stalled until the operational callback timeout whenever a provider
+asked for the state of a subscription.
+
+The lock now only guards the subscription array. A terminate unlinks
+the subscription under it and tears it down unlocked, the stop callback
+unlinks it the same way and leaves it to a terminate that was first.
+The stop-time is scheduled when the subscription is added, so that no
+error can follow once it is linked, and the add reports its errors.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/f0cbae8226040a7c2530b09a8c21c136e3ceb531
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c                | 95 +++++++++++++++-------------
+ src/utils/sn_common.h                | 18 ++++--
+ src/utils/subscribed_notifications.c | 65 ++++++++-----------
+ src/utils/subscribed_notifications.h |  3 +-
+ 4 files changed, 92 insertions(+), 89 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index fc6f2daa..99e9f61d 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -244,39 +244,68 @@ srsn_sub_free(struct srsn_sub *sub)
+             }
+         }
+     }
+-    /* find it in the array */
++
++    free(sub);
++}
++
++int
++srsn_sub_unlink(struct srsn_sub *sub)
++{
++    uint32_t i;
++
+     for (i = 0; i < snstate.count; ++i) {
+         if (snstate.subs[i] == sub) {
+             break;
+         }
+     }
+-
+-    /* remove from the array, it may not be there yet */
+-    if (i < snstate.count) {
+-        if (i < snstate.count - 1) {
+-            snstate.subs[i] = snstate.subs[snstate.count - 1];
+-        }
+-        if (!--snstate.count) {
+-            free(snstate.subs);
+-            snstate.subs = NULL;
+-        }
++    if (i == snstate.count) {
++        return 0;
+     }
+ 
+-    free(sub);
++    if (i < snstate.count - 1) {
++        snstate.subs[i] = snstate.subs[snstate.count - 1];
++    }
++    if (!--snstate.count) {
++        free(snstate.subs);
++        snstate.subs = NULL;
++    }
++    return 1;
+ }
+ 
+ /**
+- * @brief Timer callback for stopping a subscriptions.
++ * @brief Timer callback for stopping a subscription.
+  */
+ static void
+ srsn_stop_timer_cb(void *arg, int *freed)
+ {
+     struct srsn_sub *sub = arg;
+     sr_error_info_t *err_info = NULL;
++    int linked;
++
++    /* the subscription is freed here or by the srsn_terminate() that unlinked it first, the timer must not be
++     * touched afterwards */
++    *freed = 1;
+ 
+     /* TIMER UNLOCK */
+     pthread_mutex_unlock(&sub->stop_sntimer.lock);
+ 
++    /* LOCK */
++    if ((err_info = srsn_lock())) {
++        sr_errinfo_free(&err_info);
++        return;
++    }
++
++    /* once unlinked, nothing else can find and terminate the subscription */
++    linked = srsn_sub_unlink(sub);
++
++    /* UNLOCK */
++    srsn_unlock();
++
++    if (!linked) {
++        /* srsn_terminate() unlinked the subscription first, it frees it and joins this thread */
++        return;
++    }
++
+     if (sub->type == SRSN_SUB_NOTIF) {
+         while (ATOMIC_LOAD_RELAXED(sub->replay_complete_count) < ATOMIC_LOAD_RELAXED(sub->sr_sub_id_count)) {
+             /* wait until the replay is completed */
+@@ -292,38 +321,8 @@ srsn_stop_timer_cb(void *arg, int *freed)
+         sr_errinfo_free(&err_info);
+     }
+ 
+-    /* LOCK */
+-    err_info = srsn_lock();
+-
+     /* terminate the subscription */
+     srsn_sub_free(sub);
+-
+-    if (!err_info) {
+-        /* UNLOCK */
+-        srsn_unlock();
+-    } else {
+-        sr_errinfo_free(&err_info);
+-    }
+-
+-    *freed = 1;
+-}
+-
+-sr_error_info_t *
+-srsn_sub_schedule_stop(struct srsn_sub *sub)
+-{
+-    sr_error_info_t *err_info = NULL;
+-
+-    if (!sub->stop_time.tv_sec) {
+-        return NULL;
+-    }
+-
+-    /* schedule the stop */
+-    if ((err_info = srsn_create_timer(srsn_stop_timer_cb, sub, &sub->stop_time, NULL, &sub->stop_sntimer))) {
+-        goto cleanup;
+-    }
+-
+-cleanup:
+-    return err_info;
+ }
+ 
+ sr_error_info_t *
+@@ -344,11 +343,19 @@ srsn_sub_add(struct srsn_sub *sub)
+     snstate.subs[snstate.count] = sub;
+     ++snstate.count;
+ 
++    /* schedule the stop, its callback finds the subscription linked once it gets the lock */
++    if (sub->stop_time.tv_sec) {
++        if ((err_info = srsn_create_timer(srsn_stop_timer_cb, sub, &sub->stop_time, NULL, &sub->stop_sntimer))) {
++            srsn_sub_unlink(sub);
++            goto cleanup;
++        }
++    }
++
+ cleanup:
+     /* UNLOCK */
+     srsn_unlock();
+ 
+-    return NULL;
++    return err_info;
+ }
+ 
+ /**
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index fda208f6..b4832796 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -178,25 +178,29 @@ void srsn_sub_free_unsubscribe(struct srsn_sub *sub);
+ /**
+  * @brief Free a subscription.
+  *
++ * @warning @p sub MUST NOT be in internal subscriptions, unlink it first if added.
++ *
+  * @param[in] sub Subscription to free.
+  */
+ void srsn_sub_free(struct srsn_sub *sub);
+ 
+ /**
+- * @brief Schedule the stop-time of a subscription, if any.
++ * @brief Add a prepared and valid subscription into internal subscriptions and schedule its stop-time.
+  *
+- * @param[in] sub Subscription to use.
++ * @param[in] sub Subscription to add.
+  * @return err_info, NULL on success.
+  */
+-sr_error_info_t *srsn_sub_schedule_stop(struct srsn_sub *sub);
++sr_error_info_t *srsn_sub_add(struct srsn_sub *sub);
+ 
+ /**
+- * @brief Add a prepared and valid subscription into internal subscriptions.
++ * @brief Remove a subscription from internal subscriptions.
+  *
+- * @param[in] sub Subscription to add.
+- * @return err_info, NULL on success.
++ * @warning The caller MUST hold the subscription lock.
++ *
++ * @param[in] sub Subscription to remove.
++ * @return Whether @p sub was found and removed.
+  */
+-sr_error_info_t *srsn_sub_add(struct srsn_sub *sub);
++int srsn_sub_unlink(struct srsn_sub *sub);
+ 
+ /**
+  * @brief Collect information about a single subscription state.
+diff --git a/src/utils/subscribed_notifications.c b/src/utils/subscribed_notifications.c
+index 087dbcdf..64757c5e 100644
+--- a/src/utils/subscribed_notifications.c
++++ b/src/utils/subscribed_notifications.c
+@@ -188,7 +188,8 @@ srsn_subscribe(sr_session_ctx_t *session, const char *stream, const char *xpath_
+     const struct lys_module *ly_mod;
+     struct srsn_sub *s = NULL;
+     struct timespec cur_ts, replay_start;
+-    int valid;
++    int valid, rfd;
++    uint32_t id;
+ 
+     SR_CHECK_ARG_APIRET(!session || !fd || !sub_id, NULL, err_info);
+ 
+@@ -245,11 +246,6 @@ srsn_subscribe(sr_session_ctx_t *session, const char *stream, const char *xpath_
+         goto cleanup;
+     }
+ 
+-    /* add into subscriptions, is not accessible before */
+-    if ((err_info = srsn_sub_add(s))) {
+-        goto cleanup;
+-    }
+-
+     /* fill out params */
+     if (sub) {
+         /* managed by the caller now */
+@@ -258,13 +254,15 @@ srsn_subscribe(sr_session_ctx_t *session, const char *stream, const char *xpath_
+     if (replay_start_time) {
+         *replay_start_time = replay_start;
+     }
+-    *fd = s->rfd;
+-    *sub_id = s->id;
++    rfd = s->rfd;
++    id = s->id;
+ 
+-    /* schedule the stop */
+-    if ((err_info = srsn_sub_schedule_stop(s))) {
++    /* add into subscriptions, from now on another thread may terminate and free it */
++    if ((err_info = srsn_sub_add(s))) {
+         goto cleanup;
+     }
++    *fd = rfd;
++    *sub_id = id;
+ 
+ cleanup:
+     if (err_info) {
+@@ -287,6 +285,8 @@ srsn_yang_push_periodic(sr_session_ctx_t *session, sr_datastore_t ds, const char
+     sr_error_info_t *err_info = NULL;
+     struct srsn_sub *s = NULL;
+     struct lys_module *ly_mod;
++    int rfd;
++    uint32_t id;
+ 
+     SR_CHECK_ARG_APIRET(!session || !fd || !sub_id, NULL, err_info);
+ 
+@@ -330,19 +330,15 @@ srsn_yang_push_periodic(sr_session_ctx_t *session, sr_datastore_t ds, const char
+         goto cleanup;
+     }
+ 
+-    /* add into subscriptions, is not accessible before */
+-    if ((err_info = srsn_sub_add(s))) {
+-        goto cleanup;
+-    }
++    rfd = s->rfd;
++    id = s->id;
+ 
+-    /* fill out params */
+-    *fd = s->rfd;
+-    *sub_id = s->id;
+-
+-    /* schedule the stop */
+-    if ((err_info = srsn_sub_schedule_stop(s))) {
++    /* add into subscriptions, from now on another thread may terminate and free it */
++    if ((err_info = srsn_sub_add(s))) {
+         goto cleanup;
+     }
++    *fd = rfd;
++    *sub_id = id;
+ 
+ cleanup:
+     if (err_info) {
+@@ -426,11 +422,6 @@ srsn_yang_push_on_change(sr_session_ctx_t *session, sr_datastore_t ds, const cha
+     *fd = s->rfd;
+     *sub_id = s->id;
+ 
+-    /* schedule the stop */
+-    if ((err_info = srsn_sub_schedule_stop(s))) {
+-        goto cleanup;
+-    }
+-
+ cleanup:
+     if (err_info) {
+         if (s && (s->rfd > -1)) {
+@@ -770,7 +761,6 @@ API int
+ srsn_terminate(uint32_t sub_id, const char *reason)
+ {
+     sr_error_info_t *err_info = NULL;
+-    int rc = SR_ERR_OK;
+     struct srsn_sub *sub;
+ 
+     /* LOCK */
+@@ -778,9 +768,16 @@ srsn_terminate(uint32_t sub_id, const char *reason)
+         return sr_api_ret(NULL, err_info);
+     }
+ 
+-    if (!(sub = srsn_find(sub_id))) {
+-        rc = SR_ERR_NOT_FOUND;
+-        goto cleanup;
++    /* once unlinked, nothing else can find the subscription */
++    if ((sub = srsn_find(sub_id))) {
++        srsn_sub_unlink(sub);
++    }
++
++    /* UNLOCK, the teardown waits for callbacks and timers that may wait for the lock */
++    srsn_unlock();
++
++    if (!sub) {
++        return SR_ERR_NOT_FOUND;
+     }
+ 
+     /* unsubscribe to prevent any more notifications to be sent */
+@@ -788,19 +785,13 @@ srsn_terminate(uint32_t sub_id, const char *reason)
+ 
+     if (reason) {
+         /* send the subscription-terminated notification */
+-        if ((err_info = srsn_ntf_send_terminated(sub, reason))) {
+-            goto cleanup;
+-        }
++        err_info = srsn_ntf_send_terminated(sub, reason);
+     }
+ 
+     /* free subscription */
+     srsn_sub_free(sub);
+ 
+-cleanup:
+-    /* UNLOCK */
+-    srsn_unlock();
+-
+-    return err_info ? sr_api_ret(NULL, err_info) : rc;
++    return sr_api_ret(NULL, err_info);
+ }
+ 
+ API int
+diff --git a/src/utils/subscribed_notifications.h b/src/utils/subscribed_notifications.h
+index 4c0bc8c4..50d704bb 100644
+--- a/src/utils/subscribed_notifications.h
++++ b/src/utils/subscribed_notifications.h
+@@ -242,7 +242,8 @@ int srsn_resume(uint32_t sub_id);
+  * @param[in] sub_id Subscription ID of the subscription to terminate.
+  * @param[in] reason Reason for the termination as an identityref value. If not set, no notification is generated.
+  * @return ::SR_ERR_OK on success,
+- * @return ::SR_ERR_NOT_FOUND if a subscription with @p sub_id was not found.
++ * @return ::SR_ERR_NOT_FOUND if a subscription with @p sub_id was not found,
++ * @return another error code on failure.
+  */
+ int srsn_terminate(uint32_t sub_id, const char *reason);
+ 

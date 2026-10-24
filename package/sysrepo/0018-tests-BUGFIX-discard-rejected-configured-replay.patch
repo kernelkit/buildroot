@@ -1,0 +1,125 @@
+From 7da1442d377da345ba21dec1b0a157b11044ce76 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Tue, 13 Oct 2026 15:49:52 +0200
+Subject: [PATCH] tests BUGFIX discard rejected configured-replay
+
+The rejected configured-replay edit stayed staged in the session and
+was applied together with the following test-leaf change. Setting
+configured-replay again was then a no-op and the final checks matched
+the notifications of the previous step.
+
+The rejected edit is now discarded, the live notification of the
+change is consumed and the replayed one is required alongside
+subscription-modified and replay-completed. expect_notifs() matches
+XPaths instead of paths so that the replayed change can be selected.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/a5cee9cd8c7e740023e6c75562c7425ec40ddcf4
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ tests/notifd/test_notifd_lifecycle.c | 11 ++++++-----
+ tests/notifd/tnotifd.h               |  8 ++++----
+ tests/notifd/tnotifd_udp.c           | 17 +++++++++++------
+ 3 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/tests/notifd/test_notifd_lifecycle.c b/tests/notifd/test_notifd_lifecycle.c
+index 786bee8c..e9abf875 100644
+--- a/tests/notifd/test_notifd_lifecycle.c
++++ b/tests/notifd/test_notifd_lifecycle.c
+@@ -304,21 +304,22 @@ test_configured_replay(void **state)
+ 
+     /* set configured-replay before enabling replay support, this must be rejected */
+     set_node(st, NULL, SUB_XP "/configured-replay", 93);
+-    assert_int_equal(sr_apply_changes(st->sess, 0), SR_ERR_UNSUPPORTED);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
+ 
+     assert_int_equal(sr_set_module_replay_support(st->conn, "ietf-netconf-notifications", 1), SR_ERR_OK);
+ 
+-    /* make a config change, it is stored for replay (the subscription is invalid and will not
+-     * receive it live) */
++    /* make a config change, it is stored for replay and also received live */
+     set_node(st, "42", "/test:test-leaf");
+     apply_changes(st);
++    skip_notif(st, NCC);
+ 
+     /* set configured-replay again, now replay is supported */
+     set_node(st, NULL, SUB_XP "/configured-replay", 93);
+     apply_changes(st);
+ 
+-    /* the daemon does not order these three relative to each other */
+-    expect_notifs(st, (const char *[]) {SUB_MODIFIED, NCC, REPLAY_COMPLETED, NULL}, notifs);
++    /* the daemon does not order these three relative to each other, the change is the replayed one */
++    expect_notifs(st, (const char *[]) {SUB_MODIFIED, NCC "/edit[target='/test:test-leaf']", REPLAY_COMPLETED, NULL},
++            notifs);
+ 
+     /* subscription-modified reports the start of the replay, the replay-completed record names the subscription */
+     assert_int_equal(lyd_find_path(notifs[0], "replay-start-time", 0, NULL), LY_SUCCESS);
+diff --git a/tests/notifd/tnotifd.h b/tests/notifd/tnotifd.h
+index fd118768..925458e6 100644
+--- a/tests/notifd/tnotifd.h
++++ b/tests/notifd/tnotifd.h
+@@ -547,13 +547,13 @@ struct lyd_node *expect_notif_src(struct tnotifd_state *st, const char *path, ch
+ void skip_notif(struct tnotifd_state *st, const char *path);
+ 
+ /**
+- * @brief Assert that a notification arrives for each of the given paths, in any order.
++ * @brief Assert that a notification arrives for each of the given XPaths, in any order.
+  *
+  * @param[in] st Test state.
+- * @param[in] paths NULL-terminated array of paths that must all arrive.
+- * @param[out] notifs Optional array of the received notifications, one for each of @p paths, caller must free.
++ * @param[in] xpaths NULL-terminated array of XPaths, each must select a node of a different notification.
++ * @param[out] notifs Optional array of the received notifications, one for each of @p xpaths, caller must free.
+  */
+-void expect_notifs(struct tnotifd_state *st, const char **paths, struct lyd_node **notifs);
++void expect_notifs(struct tnotifd_state *st, const char **xpaths, struct lyd_node **notifs);
+ 
+ /**
+  * @brief Assert no notification with @p path arrives while the socket stays quiet.
+diff --git a/tests/notifd/tnotifd_udp.c b/tests/notifd/tnotifd_udp.c
+index a422bb43..96b780b5 100644
+--- a/tests/notifd/tnotifd_udp.c
++++ b/tests/notifd/tnotifd_udp.c
+@@ -598,14 +598,15 @@ skip_notif(struct tnotifd_state *st, const char *path)
+ }
+ 
+ void
+-expect_notifs(struct tnotifd_state *st, const char **paths, struct lyd_node **notifs)
++expect_notifs(struct tnotifd_state *st, const char **xpaths, struct lyd_node **notifs)
+ {
+     struct lyd_node *notif = NULL;
+-    char *notif_path;
++    struct ly_set *set;
+     uint8_t seen[8] = {0};
+     uint32_t i, count, found = 0;
++    int match;
+ 
+-    for (count = 0; paths[count]; ++count) {}
++    for (count = 0; xpaths[count]; ++count) {}
+     assert_true(count <= sizeof seen);
+ 
+     while (found < count) {
+@@ -614,9 +615,14 @@ expect_notifs(struct tnotifd_state *st, const char **paths, struct lyd_node **no
+             fail();
+         }
+ 
+-        notif_path = lyd_path(notif, LYD_PATH_STD, NULL, 0);
+         for (i = 0; i < count; ++i) {
+-            if (!seen[i] && notif_path && !strcmp(paths[i], notif_path)) {
++            if (seen[i]) {
++                continue;
++            }
++
++            match = !lyd_find_xpath(notif, xpaths[i], &set) && set->count;
++            ly_set_free(set, NULL);
++            if (match) {
+                 seen[i] = 1;
+                 ++found;
+                 if (notifs) {
+@@ -626,7 +632,6 @@ expect_notifs(struct tnotifd_state *st, const char **paths, struct lyd_node **no
+                 break;
+             }
+         }
+-        free(notif_path);
+         lyd_free_all(notif);
+         notif = NULL;
+     }

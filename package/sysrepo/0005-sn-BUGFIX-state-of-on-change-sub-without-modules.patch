@@ -1,0 +1,111 @@
+From 317cb4dae7382f09cf7ca8c60a1102fc9f3f332d Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:33:54 +0200
+Subject: [PATCH] sn BUGFIX state of on-change sub without modules
+
+An on-change subscription whose filter selects no data of its datastore,
+such as state-only nodes on running, has no SR subscriptions. Its state
+collection then asserted and read the first of no subscription IDs.
+
+The state collection, suspend and resume treat such a subscription as
+not suspended with nothing to suspend.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/2aebdd46cf1715ac0358d9f0d5b6caf46a97f600
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c                |  7 ++++---
+ src/utils/subscribed_notifications.c |  8 ++++++++
+ tests/test_sub_notif.c               | 29 ++++++++++++++++++++++++++++
+ 3 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index 2660eb11..fc6f2daa 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -413,9 +413,10 @@ srsn_state_collect_sub(const struct srsn_sub *s, srsn_state_sub_t *sub)
+     switch (s->type) {
+     case SRSN_SUB_NOTIF:
+     case SRSN_YANG_PUSH_ON_CHANGE:
+-        assert(s->sr_sub_id_count);
+-        if ((r = sr_subscription_get_suspended(s->sr_sub, s->sr_sub_ids[0],
+-                &sub->suspended))) {
++        if (!ATOMIC_LOAD_RELAXED(s->sr_sub_id_count)) {
++            /* a filter selecting no data of the datastore, nothing can be suspended */
++            sub->suspended = 0;
++        } else if ((r = sr_subscription_get_suspended(s->sr_sub, s->sr_sub_ids[0], &sub->suspended))) {
+             sr_errinfo_new(&err_info, r, "Failed to learn whether a SR subscription is suspended.");
+             return err_info;
+         }
+diff --git a/src/utils/subscribed_notifications.c b/src/utils/subscribed_notifications.c
+index b03648b8..087dbcdf 100644
+--- a/src/utils/subscribed_notifications.c
++++ b/src/utils/subscribed_notifications.c
+@@ -617,6 +617,10 @@ srsn_suspend(uint32_t sub_id, const char *reason)
+     switch (sub->type) {
+     case SRSN_SUB_NOTIF:
+     case SRSN_YANG_PUSH_ON_CHANGE:
++        if (!ATOMIC_LOAD_RELAXED(sub->sr_sub_id_count)) {
++            /* no SR subscriptions, nothing to suspend */
++            break;
++        }
+         if (!sr_subscription_get_suspended(sub->sr_sub, sub->sr_sub_ids[0], &suspended) && suspended) {
+             /* already suspended */
+             goto cleanup;
+@@ -701,6 +705,10 @@ srsn_resume(uint32_t sub_id)
+     switch (sub->type) {
+     case SRSN_SUB_NOTIF:
+     case SRSN_YANG_PUSH_ON_CHANGE:
++        if (!ATOMIC_LOAD_RELAXED(sub->sr_sub_id_count)) {
++            /* no SR subscriptions, nothing to resume */
++            break;
++        }
+         if (!sr_subscription_get_suspended(sub->sr_sub, sub->sr_sub_ids[0], &suspended) && !suspended) {
+             /* already active */
+             goto cleanup;
+diff --git a/tests/test_sub_notif.c b/tests/test_sub_notif.c
+index d8d70a57..d83e7785 100644
+--- a/tests/test_sub_notif.c
++++ b/tests/test_sub_notif.c
+@@ -789,6 +789,34 @@ test_yp_on_change_dampening(void **state)
+     assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
+ }
+ 
++/* TEST */
++static void
++test_yp_on_change_no_module(void **state)
++{
++    struct state *st = *state;
++    srsn_state_sub_t *state_sub;
++    int fd;
++    uint32_t sub_id;
++
++    /* the filter selects only state data, there is nothing to subscribe to on running */
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change(st->sess, SR_DS_RUNNING, "/test:test-leafref", 0, 0, NULL,
++            NULL, 0, NULL, &fd, &sub_id));
++
++    assert_int_equal(SR_ERR_OK, srsn_oper_data_sub(sub_id, &state_sub));
++    assert_int_equal(state_sub->sub_id, sub_id);
++    assert_int_equal(state_sub->suspended, 0);
++    assert_int_equal(state_sub->excluded_count, 0);
++    srsn_oper_data_subscriptions_free(state_sub, 1);
++
++    assert_int_equal(SR_ERR_OK, srsn_suspend(sub_id, NULL));
++    assert_int_equal(SR_ERR_OK, srsn_resume(sub_id));
++    yp_expect_notif(st, fd, 1000, "subscription-resumed", NULL);
++
++    /* cleanup */
++    assert_int_equal(SR_ERR_OK, srsn_terminate(sub_id, NULL));
++    close(fd);
++}
++
+ /* TEST */
+ static int
+ setup_nacm(void **state)
+@@ -1111,6 +1139,7 @@ main(void)
+         cmocka_unit_test(test_yp_periodic),
+         cmocka_unit_test(test_yp_on_change),
+         cmocka_unit_test(test_yp_on_change_dampening),
++        cmocka_unit_test(test_yp_on_change_no_module),
+         cmocka_unit_test(test_read_eof),
+         cmocka_unit_test_setup_teardown(test_nacm_sub, setup_nacm, teardown_nacm),
+         cmocka_unit_test_setup_teardown(test_nacm_yp_periodic, setup_nacm, teardown_nacm),

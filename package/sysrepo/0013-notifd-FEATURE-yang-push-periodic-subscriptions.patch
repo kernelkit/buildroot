@@ -1,0 +1,2284 @@
+From 5594ae1e3fd6727ac910cafb651316f7549cadb1 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 18:03:00 +0200
+Subject: [PATCH] notifd FEATURE yang-push periodic subscriptions
+
+Configured RFC 8641 datastore subscriptions with a periodic update
+trigger. The datastore target is parsed with its selection filter, by
+reference or within the subscription, a subtree one converted into the
+node set it selects. Every resubscription parses the target and the
+update policy again from the stored subscription, so any change of the
+stream or datastore target or of the update policy just resubscribes.
+That replaces the per-leaf handlers of the stream target, and a switch
+of the target case needs no special handling. A named filter is read
+like one within the subscription, so an empty stream subtree filter
+means no filter in both.
+
+The validation rejects a datastore without a sysrepo counterpart, a
+subscription without an update trigger, a period of 0 or one that does
+not fit in milliseconds, and a selection filter, also a named one,
+with nodes that do not exist or an empty subtree, which would silently
+select nothing (RFC 8641 section 3.9 allows the rejection). The state
+change notifications report the datastore target and the update
+policy. The generated records are left to SRSN, the dispatch loop only
+sets the configured subscription ID in the ietf-yang-push records of a
+datastore subscription.
+
+ietf-yang-push stays optional for the daemon, setup_notifd.sh installs
+it with on-change.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/20e756e510a558d3a499615b2272aa0c928b9aa8
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ scripts/remove_notifd.sh                      |   2 +
+ scripts/setup_notifd.sh                       |   2 +
+ src/executables/sysrepo-notifd/main.c         |  49 +-
+ src/executables/sysrepo-notifd/notifd.h       |  24 +-
+ .../sysrepo-notifd/notifd_common.h            | 131 +--
+ .../sysrepo-notifd/notifd_config.c            | 830 +++++++++++-------
+ .../sysrepo-notifd/notifd_control.c           |  46 +-
+ .../sysrepo-notifd/notifd_dispatch.c          |  25 +-
+ .../sysrepo-notifd/notifd_runtime.c           | 170 +++-
+ .../sysrepo-notifd/sysrepo-notifd.8           |   2 +
+ tests/CMakeLists.txt                          |   2 +-
+ tests/notifd/test_notifd_yang_push.c          | 269 ++++++
+ tests/notifd/tnotifd.c                        |  66 ++
+ tests/notifd/tnotifd.h                        |  45 +
+ 14 files changed, 1189 insertions(+), 474 deletions(-)
+ create mode 100644 tests/notifd/test_notifd_yang_push.c
+
+diff --git a/scripts/remove_notifd.sh b/scripts/remove_notifd.sh
+index bf59d4ef..dbfb2a40 100755
+--- a/scripts/remove_notifd.sh
++++ b/scripts/remove_notifd.sh
+@@ -17,6 +17,8 @@ fi
+ # modules to uninstall (in reverse order of their dependencies)
+ MODULES=(
+ "ietf-subscribed-notif-receivers"
++"ietf-yang-push"
++"ietf-yang-patch"
+ "ietf-subscribed-notifications"
+ "ietf-udp-notif-transport"
+ )
+diff --git a/scripts/setup_notifd.sh b/scripts/setup_notifd.sh
+index 8246e88b..c3856e6f 100755
+--- a/scripts/setup_notifd.sh
++++ b/scripts/setup_notifd.sh
+@@ -35,6 +35,8 @@ MODULES=(
+ "ietf-interfaces@2018-02-20.yang"
+ "ietf-network-instance@2019-01-21.yang"
+ "ietf-subscribed-notifications@2019-09-09.yang -e configured -e replay -e subtree -e xpath -e encode-xml -e encode-json"
++"ietf-yang-patch@2017-02-22.yang"
++"ietf-yang-push@2019-09-09.yang -e on-change"
+ "ietf-subscribed-notif-receivers@2024-02-01.yang"
+ "ietf-udp-notif-transport@2025-06-04.yang"
+ )
+diff --git a/src/executables/sysrepo-notifd/main.c b/src/executables/sysrepo-notifd/main.c
+index 3de12927..9879fdc5 100644
+--- a/src/executables/sysrepo-notifd/main.c
++++ b/src/executables/sysrepo-notifd/main.c
+@@ -519,6 +519,29 @@ cleanup:
+     return rc;
+ }
+ 
++/**
++ * @brief Check whether a node configures the event stream or the yang-push datastore subscription.
++ *
++ * Both are the descendants of the "target" choice of ietf-subscribed-notifications, extended with the
++ * "datastore" case by ietf-yang-push, and of the "update-trigger" choice of ietf-yang-push.
++ *
++ * @param[in] node Descendant node of a subscription.
++ * @return Whether it does.
++ */
++static int
++sub_node_is_stream_or_yang_push(const struct lyd_node *node)
++{
++    const struct lysc_node *snode;
++
++    for (snode = node->schema; snode; snode = snode->parent) {
++        if ((snode->nodetype == LYS_CHOICE) && (!strcmp(snode->name, "target") ||
++                !strcmp(snode->name, "update-trigger"))) {
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ static int
+ sub_change_modify_subscriptions(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session)
+ {
+@@ -551,20 +574,15 @@ sub_change_modify_subscriptions(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *sess
+             continue;
+         }
+ 
+-        if (!strcmp(node_name, "stream")) {
+-            r = handle_stream(sub, node, op);
+-        } else if (!strcmp(node_name, "stream-filter-name")) {
+-            r = handle_stream_filter_name(notifd_ctx, sub, node, op);
+-        } else if (!strcmp(node_name, "stream-subtree-filter")) {
+-            r = handle_stream_subtree_filter(notifd_ctx, sub, node, op);
+-        } else if (!strcmp(node_name, "stream-xpath-filter")) {
+-            r = handle_stream_xpath_filter(sub, node, op);
++        if (sub_node_is_stream_or_yang_push(node)) {
++            /* parsed again once all the changes are known */
++            sub->modified = 1;
++            sub->resubscribe = 1;
++            r = 0;
+         } else if (!strcmp(node_name, "encoding")) {
+             r = handle_encoding(sub, node, op);
+         } else if (!strcmp(node_name, "stop-time")) {
+             r = handle_stop_time(sub, node, op);
+-        } else if (!strcmp(node_name, "configured-replay")) {
+-            r = handle_configured_replay(notifd_ctx, sub, node, op);
+         } else if (!strcmp(node_name, "purpose")) {
+             r = handle_purpose(sub, node, op);
+         } else if (!strcmp(node_name, "source-address")) {
+@@ -798,7 +816,8 @@ subscribed_notifications_filter_change_cb(sr_session_ctx_t *session, uint32_t su
+     }
+     state_locked = 1;
+ 
+-    if ((rc = sr_get_changes_iter(session, "/ietf-subscribed-notifications:filters/stream-filter//.", &iter))) {
++    /* both the stream filters and the yang-push selection filters */
++    if ((rc = sr_get_changes_iter(session, "/ietf-subscribed-notifications:filters//.", &iter))) {
+         goto cleanup;
+     }
+     while (!sr_get_change_tree_next(session, iter, &op, &node, &prev_value, &prev_list, &prev_dflt)) {
+@@ -812,10 +831,10 @@ subscribed_notifications_filter_change_cb(sr_session_ctx_t *session, uint32_t su
+             continue;
+         }
+ 
+-        if (!strcmp(node_name, "stream-subtree-filter")) {
+-            r = handle_filter(notifd_ctx, node, 1);
+-        } else if (!strcmp(node_name, "stream-xpath-filter")) {
+-            r = handle_filter(notifd_ctx, node, 0);
++        if (!strcmp(node_name, "stream-subtree-filter") || !strcmp(node_name, "stream-xpath-filter")) {
++            r = handle_filter(notifd_ctx, node, NOTIF_FILTER_TYPE_STREAM);
++        } else if (!strcmp(node_name, "datastore-subtree-filter") || !strcmp(node_name, "datastore-xpath-filter")) {
++            r = handle_filter(notifd_ctx, node, NOTIF_FILTER_TYPE_DATASTORE);
+         } else {
+             r = 0;
+         }
+diff --git a/src/executables/sysrepo-notifd/notifd.h b/src/executables/sysrepo-notifd/notifd.h
+index bbf4f200..65ae22d2 100644
+--- a/src/executables/sysrepo-notifd/notifd.h
++++ b/src/executables/sysrepo-notifd/notifd.h
+@@ -154,6 +154,15 @@ typedef enum {
+     NOTIF_TRANSPORT_TYPE_UDP        /**< UDP transport */
+ } notif_transport_type_t;
+ 
++/**
++ * @brief Type of a named filter.
++ */
++typedef enum {
++    NOTIF_FILTER_TYPE_STREAM = 0,   /**< stream-filter of ietf-subscribed-notifications, filters event stream
++                                         notifications */
++    NOTIF_FILTER_TYPE_DATASTORE     /**< selection-filter of ietf-yang-push, selects datastore nodes */
++} notif_filter_type_t;
++
+ /**
+  * @brief Notification encoding type.
+  */
+@@ -399,10 +408,19 @@ struct notif_receiver_s {
+  * @brief Arguments of the srsn subscribe functions, the control thread starts a receiver with a copy.
+  */
+ typedef struct notif_srsn_params_s {
+-    char *xpath_filter;                 /**< optional XPath filter */
++    /* all subscriptions */
++    srsn_sub_type_t type;               /**< stream, yang-push periodic or yang-push on-change */
++    char *xpath_filter;                 /**< optional stream or datastore filter, subtree ones converted */
+     struct timespec stop_time;          /**< optional stop time */
++
++    /* event stream subscriptions only */
+     char *stream;                       /**< stream name */
+     struct timespec start_time;         /**< requested replay start time for configured-replay */
++
++    /* yang-push subscriptions only */
++    sr_datastore_t ds;                  /**< datastore */
++    uint32_t period;                    /**< period in centiseconds, periodic only */
++    struct timespec anchor_time;        /**< optional anchor time, periodic only */
+ } notif_srsn_params_t;
+ 
+ /**
+@@ -429,7 +447,9 @@ struct notif_sub_s {
+     char *local_address;                /**< local address to send notifications from (NULL means OS default) */
+ 
+     notif_srsn_params_t srsn_params;    /**< parameters of the srsn subscription of every receiver */
+-    char *filter_ref;                   /**< optional stream filter name (e.g., XPath or subtree filter) */
++    char *filter_ref;                   /**< optional stream-filter-name or selection-filter-ref, by type */
++
++    /* event stream subscriptions only */
+     int replay;                         /**< whether to replay notifications */
+     struct timespec replay_start_time;  /**< actual replay start time returned by srsn_subscribe */
+ 
+diff --git a/src/executables/sysrepo-notifd/notifd_common.h b/src/executables/sysrepo-notifd/notifd_common.h
+index 44d8d4c0..0d890c16 100644
+--- a/src/executables/sysrepo-notifd/notifd_common.h
++++ b/src/executables/sysrepo-notifd/notifd_common.h
+@@ -39,30 +39,41 @@ extern const notif_transport_ops_t udp_transport_ops;
+  */
+ const notif_transport_ops_t *notif_transport_find_by_identity(const char *identity);
+ 
+-/** @brief Bitmask: include the `stream` field in a state-change notification. */
+-#define NOTIF_FIELD_STREAM         0x01
++/**
++ * @brief Map a datastore identity of a yang-push subscription to a sysrepo datastore.
++ *
++ * @param[in] identity Datastore identityref value.
++ * @param[out] ds Sysrepo datastore.
++ * @return ::SR_ERR_OK on success, ::SR_ERR_UNSUPPORTED if the datastore cannot be subscribed to.
++ */
++int notif_ds_from_identity(const char *identity, sr_datastore_t *ds);
++
++/**
++ * @brief Map a sysrepo datastore of a yang-push subscription to its identity.
++ *
++ * @param[in] ds Sysrepo datastore.
++ * @return Datastore identityref value, NULL if there is none.
++ */
++const char *notif_ds2identity(sr_datastore_t ds);
+ 
+-/** @brief Bitmask: include the `xpath-filter` field in a state-change notification. */
+-#define NOTIF_FIELD_XPATH_FILTER   0x02
++/** @brief Bitmask: include the target (stream or datastore with its filter) in a state-change notification. */
++#define NOTIF_FIELD_TARGET          0x01
+ 
+-/** @brief Bitmask: include the `stop-time` field in a state-change notification. */
+-#define NOTIF_FIELD_STOP_TIME      0x04
++/** @brief Bitmask: include the yang-push update policy in a state-change notification. */
++#define NOTIF_FIELD_UPDATE_POLICY   0x02
+ 
+-/** @brief Bitmask: include the `replay-start-time` field in a state-change notification. */
+-#define NOTIF_FIELD_REPLAY_START   0x08
++/** @brief Bitmask: include the `stop-time` field in a state-change notification. */
++#define NOTIF_FIELD_STOP_TIME       0x04
+ 
+ /** @brief Bitmask: include the `transport` field in a state-change notification. */
+-#define NOTIF_FIELD_TRANSPORT      0x10
++#define NOTIF_FIELD_TRANSPORT       0x10
+ 
+ /** @brief Bitmask: include the `encoding` field in a state-change notification. */
+-#define NOTIF_FIELD_ENCODING       0x20
++#define NOTIF_FIELD_ENCODING        0x20
+ 
+ /** @brief Bitmask: include the `purpose` field in a state-change notification. */
+ #define NOTIF_FIELD_PURPOSE         0x40
+ 
+-/** @brief Bitmask: include the `stream-filter-name` field in a state-change notification. */
+-#define NOTIF_FIELD_FILTER_REF     0x80
+-
+ /*
+  * ---------------------------------------------------------------------------
+  * Encoding registry (defined in notifd_config.c)
+@@ -319,62 +330,6 @@ int receiver_instance_create_from_node(notifd_ctx_t *notifd_ctx, const struct ly
+  */
+ int receiver_instance_destroy_from_node(notifd_ctx_t *notifd_ctx, const struct lyd_node *node);
+ 
+-/**
+- * @brief Handle a change to the `stream` leaf of a subscription.
+- *
+- * On modification, updates the subscription's stream name and marks the
+- * subscription as modified and needing resubscription.
+- *
+- * @param[in,out] sub Subscription being modified.
+- * @param[in] node The YANG `stream` leaf node with the new value.
+- * @param[in] op Sysrepo change operation (only ::SR_OP_MODIFIED is handled).
+- * @return ::SR_ERR_OK on success, ::SR_ERR_NO_MEMORY on allocation failure.
+- */
+-int handle_stream(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+-
+-/**
+- * @brief Handle a change to the `stream-filter-name` leaf of a subscription.
+- *
+- * On create/modify, resolves the filter name to an XPath filter string via
+- * the datastore. On delete, clears the filter reference and XPath filter.
+- * Marks the subscription as modified and needing resubscription.
+- *
+- * @param[in,out] notifd_ctx Daemon context (used to access the sysrepo session).
+- * @param[in,out] sub Subscription being modified.
+- * @param[in] node The YANG `stream-filter-name` leaf node.
+- * @param[in] op Sysrepo change operation.
+- * @return ::SR_ERR_OK on success, error code on failure.
+- */
+-int handle_stream_filter_name(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+-
+-/**
+- * @brief Handle a change to the `stream-subtree-filter` anydata node of a subscription.
+- *
+- * On create/modify, extracts the filter subtree and converts it to an XPath
+- * filter. On delete, clears the XPath filter. Marks the subscription as
+- * modified and needing resubscription.
+- *
+- * @param[in,out] notifd_ctx Daemon context (used for sysrepo session).
+- * @param[in,out] sub Subscription being modified.
+- * @param[in] node The YANG `stream-subtree-filter` anydata node.
+- * @param[in] op Sysrepo change operation.
+- * @return ::SR_ERR_OK on success, error code on failure.
+- */
+-int handle_stream_subtree_filter(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+-
+-/**
+- * @brief Handle a change to the `stream-xpath-filter` leaf of a subscription.
+- *
+- * On create/modify, duplicates the new XPath value. On delete, clears the
+- * XPath filter. Marks the subscription as modified and needing resubscription.
+- *
+- * @param[in,out] sub Subscription being modified.
+- * @param[in] node The YANG `stream-xpath-filter` leaf node.
+- * @param[in] op Sysrepo change operation.
+- * @return ::SR_ERR_OK on success, ::SR_ERR_NO_MEMORY on allocation failure.
+- */
+-int handle_stream_xpath_filter(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+-
+ /**
+  * @brief Handle a change to the `encoding` leaf of a subscription.
+  *
+@@ -403,21 +358,6 @@ int handle_encoding(notif_sub_t *sub, const struct lyd_node *node, sr_change_ope
+  */
+ int handle_stop_time(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+ 
+-/**
+- * @brief Handle a change to the `configured-replay` leaf of a subscription.
+- *
+- * On create, enables replay and validates that the stream supports it, then
+- * sets the subscription start time to the earliest replay start time. On delete,
+- * disables replay and clears the start time.
+- *
+- * @param[in,out] notifd_ctx Daemon context (used to check replay support).
+- * @param[in,out] sub Subscription being modified.
+- * @param[in] node The YANG `configured-replay` leaf node (type empty).
+- * @param[in] op Sysrepo change operation.
+- * @return ::SR_ERR_OK on success, ::SR_ERR_UNSUPPORTED if the stream does not support replay.
+- */
+-int handle_configured_replay(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+-
+ /**
+  * @brief Handle a change to the `purpose` leaf of a subscription.
+  *
+@@ -489,24 +429,23 @@ int receiver_inst_config_change(notif_receiver_inst_t *recv_inst, const struct l
+ int handle_receiver_instance_ref(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op);
+ 
+ /**
+- * @brief Handle a change to a `stream-filter` entry in the global filters list.
++ * @brief Handle a change to a `stream-filter` or `selection-filter` entry in the global filters list.
+  *
+- * When a named filter changes, finds all subscriptions that reference it by
+- * name and updates their xpath_filter accordingly. Only marks a subscription
+- * for resubscription if the effective XPath filter actually changed.
++ * Marks the subscriptions referencing the filter for resubscription if their effective XPath filter changed.
+  *
+  * @param[in,out] notifd_ctx Daemon context.
+- * @param[in] node The changed filter node (either `stream-subtree-filter` or `stream-xpath-filter`).
+- * @param[in] is_subtree Non-zero if the changed node is a subtree filter, zero if it is an xpath filter.
++ * @param[in] node The changed filter node, a subtree or an xpath filter.
++ * @param[in] type Type of the filter, only the subscriptions of the matching type reference it.
+  * @return ::SR_ERR_OK on success, error code on failure.
+  */
+-int handle_filter(notifd_ctx_t *notifd_ctx, const struct lyd_node *node, int is_subtree);
++int handle_filter(notifd_ctx_t *notifd_ctx, const struct lyd_node *node, notif_filter_type_t type);
+ 
+ /**
+  * @brief Post-processing pass after subscription configuration changes.
+  *
+- * For subscriptions flagged resubscribe: restarts the srsn subscriptions of
+- * the receivers and marks VALID. For subscriptions flagged
++ * For subscriptions flagged resubscribe: parses the target again from the stored
++ * configuration and restarts the srsn subscriptions of the receivers; on
++ * success marks VALID, on failure invalidates. For subscriptions flagged
+  * modified or with a modif_err_reason: if VALID, sends `subscription-modified`;
+  * if INVALID, sends `subscription-terminated` with the error reason.
+  * Resets the modified, resubscribe, and modif_err_reason flags.
+@@ -594,8 +533,7 @@ int timespec_cmp(const struct timespec *ts1, const struct timespec *ts2);
+ /**
+  * @brief Send a `subscription-started` notification to one or all receivers.
+  *
+- * Includes stream, filter (stream-filter-name or stream-xpath-filter), stop-time,
+- * replay-start-time, transport, encoding, and purpose fields.
++ * Includes the target with its filter, the update policy, stop-time, transport, encoding, and purpose fields.
+  * Does not skip inactive receivers -- send failures are fatal.
+  *
+  * @param[in] notifd_ctx Daemon context.
+@@ -621,8 +559,7 @@ int subscription_terminated_notif_send(notifd_ctx_t *notifd_ctx, notif_sub_t *su
+ /**
+  * @brief Send a `subscription-modified` notification to one or all receivers.
+  *
+- * Includes stream, filter (stream-filter-name or stream-xpath-filter), stop-time,
+- * replay-start-time, transport, encoding, and purpose fields.
++ * Includes the target with its filter, the update policy, stop-time, transport, encoding, and purpose fields.
+  * Skips inactive receivers silently.
+  *
+  * @param[in] notifd_ctx Daemon context.
+diff --git a/src/executables/sysrepo-notifd/notifd_config.c b/src/executables/sysrepo-notifd/notifd_config.c
+index 6c035ef0..7ce91ff0 100644
+--- a/src/executables/sysrepo-notifd/notifd_config.c
++++ b/src/executables/sysrepo-notifd/notifd_config.c
+@@ -385,11 +385,109 @@ notif_encoding_parse(const struct lyd_node *node, notif_encoding_t *encoding)
+     return rc;
+ }
+ 
++/**
++ * @brief Datastore identities of yang-push subscriptions, ietf-datastores:intended has no sysrepo datastore.
++ */
++static const struct {
++    const char *identity;
++    sr_datastore_t ds;
++} notif_ds_map[] = {
++    {"ietf-datastores:running", SR_DS_RUNNING},
++    {"ietf-datastores:startup", SR_DS_STARTUP},
++    {"ietf-datastores:candidate", SR_DS_CANDIDATE},
++    {"ietf-datastores:operational", SR_DS_OPERATIONAL},
++    {"ietf-factory-default:factory-default", SR_DS_FACTORY_DEFAULT},
++};
++
++int
++notif_ds_from_identity(const char *identity, sr_datastore_t *ds)
++{
++    uint32_t i;
++
++    for (i = 0; i < sizeof notif_ds_map / sizeof *notif_ds_map; ++i) {
++        if (!strcmp(notif_ds_map[i].identity, identity)) {
++            *ds = notif_ds_map[i].ds;
++            return SR_ERR_OK;
++        }
++    }
++
++    return SR_ERR_UNSUPPORTED;
++}
++
++const char *
++notif_ds2identity(sr_datastore_t ds)
++{
++    uint32_t i;
++
++    for (i = 0; i < sizeof notif_ds_map / sizeof *notif_ds_map; ++i) {
++        if (notif_ds_map[i].ds == ds) {
++            return notif_ds_map[i].identity;
++        }
++    }
++
++    return NULL;
++}
++
++/**
++ * @brief Get the XPath filter of a filter choice, a subtree filter converted.
++ *
++ * @param[in] sess Session to convert a subtree filter with.
++ * @param[in] parent Parent of the choice, a named filter or a subscription.
++ * @param[in] type Type of the filter.
++ * @param[out] xpath_filter XPath filter, NULL if there is none.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
+ static int
+-stream_filter_xpath_get(sr_session_ctx_t *sess, const char *filter_name, char **xpath_filter)
++filter_from_node(sr_session_ctx_t *sess, const struct lyd_node *parent, notif_filter_type_t type, char **xpath_filter)
++{
++    int rc = SR_ERR_OK, for_eval;
++    const char *subtree_name, *xpath_name;
++    struct lyd_node *filter;
++
++    if (type == NOTIF_FILTER_TYPE_STREAM) {
++        /* a stream filter evaluates to a boolean on the notification */
++        subtree_name = "ietf-subscribed-notifications:stream-subtree-filter";
++        xpath_name = "ietf-subscribed-notifications:stream-xpath-filter";
++        for_eval = 1;
++    } else {
++        /* a selection filter selects the datastore nodes */
++        subtree_name = "ietf-yang-push:datastore-subtree-filter";
++        xpath_name = "ietf-yang-push:datastore-xpath-filter";
++        for_eval = 0;
++    }
++
++    /* subtree filter, anydata whose first child is the first actual filter sibling */
++    get_descendant_optional(parent, subtree_name, &filter);
++    if (filter && lyd_child_any(filter)) {
++        rc = sr_filter_subtree2xpath(sess, lyd_child_any(filter), for_eval, xpath_filter);
++        goto cleanup;
++    }
++
++    /* xpath filter, the other case of the choice */
++    get_descendant_optional(parent, xpath_name, &filter);
++    if (filter) {
++        *xpath_filter = strdup(lyd_get_value(filter));
++        CHECK_ERRMEM_GOTO(*xpath_filter, rc, cleanup);
++    }
++
++cleanup:
++    return rc;
++}
++
++/**
++ * @brief Get the XPath filter of a named filter.
++ *
++ * @param[in] sess Session to get the filter with.
++ * @param[in] type Type of the filter.
++ * @param[in] filter_name Name of the filter.
++ * @param[out] xpath_filter XPath filter, a subtree filter converted, NULL if the filter does not exist.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++filter_xpath_get(sr_session_ctx_t *sess, notif_filter_type_t type, const char *filter_name, char **xpath_filter)
+ {
+     int rc = SR_ERR_OK;
+-    struct lyd_node *filter, *tree;
++    struct lyd_node *tree;
+     char *path = NULL, quot;
+     sr_data_t *data = NULL;
+ 
+@@ -398,8 +496,14 @@ stream_filter_xpath_get(sr_session_ctx_t *sess, const char *filter_name, char **
+     quot = strchr(filter_name, '\'') ? '\"' : '\'';
+ 
+     /* get the filter with this name */
+-    if ((asprintf(&path, "/ietf-subscribed-notifications:filters/stream-filter[name=%c%s%c]", quot, filter_name,
+-            quot) == -1)) {
++    if (type == NOTIF_FILTER_TYPE_STREAM) {
++        rc = asprintf(&path, "/ietf-subscribed-notifications:filters/stream-filter[name=%c%s%c]", quot,
++                filter_name, quot);
++    } else {
++        rc = asprintf(&path, "/ietf-subscribed-notifications:filters/ietf-yang-push:selection-filter[filter-id=%c%s%c]",
++                quot, filter_name, quot);
++    }
++    if (rc == -1) {
+         rc = SR_ERR_NO_MEMORY;
+         ERRMEM;
+         goto cleanup;
+@@ -419,21 +523,7 @@ stream_filter_xpath_get(sr_session_ctx_t *sess, const char *filter_name, char **
+         goto cleanup;
+     }
+ 
+-    /* because it's a choice, only one of the two filter types can be present */
+-    get_descendant_optional(tree, "stream-subtree-filter", &filter);
+-    if (filter) {
+-        /* convert the subtree filter to an xpath filter, subtree is anydata so use lyd_child_any */
+-        if ((rc = sr_filter_subtree2xpath(sess, lyd_child_any(filter), 1, xpath_filter))) {
+-            goto cleanup;
+-        }
+-    }
+-
+-    get_descendant_optional(tree, "stream-xpath-filter", &filter);
+-    if (filter) {
+-        /* filter is already an xpath filter, just return the value */
+-        *xpath_filter = strdup(lyd_get_value(filter));
+-        CHECK_ERRMEM_GOTO(*xpath_filter, rc, cleanup);
+-    }
++    rc = filter_from_node(sess, tree, type, xpath_filter);
+ 
+ cleanup:
+     free(path);
+@@ -665,147 +755,6 @@ sub_invalidate(notif_sub_t *sub, const char *reason)
+     }
+ }
+ 
+-int
+-handle_stream(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+-{
+-    int rc = SR_ERR_OK;
+-
+-    /* mandatory leaf, cr + del handled by 'subscription', so only handle mod */
+-    if (op == SR_OP_MODIFIED) {
+-        /* switch to the new value */
+-        free(sub->srsn_params.stream);
+-        sub->srsn_params.stream = strdup(lyd_get_value(node));
+-        if (!sub->srsn_params.stream) {
+-            rc = SR_ERR_NO_MEMORY;
+-            ERRMEM;
+-            goto cleanup;
+-        }
+-
+-        /* mark sub as modified so we know to send subscription-modified notification */
+-        sub->modified = 1;
+-        sub->resubscribe = 1;
+-    }
+-
+-cleanup:
+-    if (rc) {
+-        sub_invalidate(sub, NULL);
+-    }
+-    return rc;
+-}
+-
+-int
+-handle_stream_filter_name(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+-{
+-    int rc = SR_ERR_OK;
+-
+-    /* optional leaf, need to handle all but move */
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED)) {
+-        /* free the old filter */
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = NULL;
+-        free(sub->filter_ref);
+-        sub->filter_ref = NULL;
+-
+-        /* dup the referenced filter name */
+-        sub->filter_ref = strdup(lyd_get_value(node));
+-        CHECK_ERRMEM_GOTO(sub->filter_ref, rc, cleanup);
+-
+-        /* get the xpath filter from the referenced stream filter */
+-        if ((rc = stream_filter_xpath_get(notifd_ctx->sr_sess, sub->filter_ref, &sub->srsn_params.xpath_filter))) {
+-            goto cleanup;
+-        }
+-    } else if (op == SR_OP_DELETED) {
+-        /* just reset all filter info */
+-        free(sub->filter_ref);
+-        sub->filter_ref = NULL;
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = NULL;
+-    }
+-
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED) || (op == SR_OP_DELETED)) {
+-        /* mark sub as modified so we know to send subscription-modified notification */
+-        sub->modified = 1;
+-        sub->resubscribe = 1;
+-    }
+-
+-cleanup:
+-    if (rc) {
+-        sub_invalidate(sub, NULL);
+-    }
+-    return rc;
+-}
+-
+-int
+-handle_stream_subtree_filter(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+-{
+-    int rc = SR_ERR_OK;
+-    struct lyd_node *filter;
+-
+-    /* optional leaf, need to handle all but move */
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED)) {
+-        /* free the old filter */
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = NULL;
+-
+-        /* get the first child of the anydata stream-subtree-filter node, which is the first actual filter sibling */
+-        filter = lyd_child_any(node);
+-        if (filter) {
+-            /* filter exists, convert it to an xpath filter and switch to the new value */
+-            if ((rc = sr_filter_subtree2xpath(notifd_ctx->sr_sess, filter, 1, &sub->srsn_params.xpath_filter))) {
+-                goto cleanup;
+-            }
+-        }
+-    } else if (op == SR_OP_DELETED) {
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = NULL;
+-    }
+-
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED) || (op == SR_OP_DELETED)) {
+-        /* mark sub as modified so we know to send subscription-modified notification */
+-        sub->modified = 1;
+-        sub->resubscribe = 1;
+-    }
+-
+-cleanup:
+-    if (rc) {
+-        sub_invalidate(sub, NULL);
+-    }
+-    return rc;
+-}
+-
+-int
+-handle_stream_xpath_filter(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+-{
+-    int rc = SR_ERR_OK;
+-
+-    /* optional leaf, need to handle all but move */
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED)) {
+-        /* switch to the new value */
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = strdup(lyd_get_value(node));
+-        if (!sub->srsn_params.xpath_filter) {
+-            rc = SR_ERR_NO_MEMORY;
+-            ERRMEM;
+-            goto cleanup;
+-        }
+-    } else if (op == SR_OP_DELETED) {
+-        free(sub->srsn_params.xpath_filter);
+-        sub->srsn_params.xpath_filter = NULL;
+-    }
+-
+-    if ((op == SR_OP_CREATED) || (op == SR_OP_MODIFIED) || (op == SR_OP_DELETED)) {
+-        /* mark sub as modified so we know to send subscription-modified notification */
+-        sub->modified = 1;
+-        sub->resubscribe = 1;
+-    }
+-
+-cleanup:
+-    if (rc) {
+-        sub_invalidate(sub, NULL);
+-    }
+-    return rc;
+-}
+-
+ int
+ handle_encoding(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+ {
+@@ -865,46 +814,6 @@ cleanup:
+     return rc;
+ }
+ 
+-int
+-handle_configured_replay(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *UNUSED(node), sr_change_oper_t op)
+-{
+-    int rc = SR_ERR_OK;
+-    struct timespec replay_start_time = {0};
+-
+-    /* optional leaf, type empty, so only handle create and delete */
+-    if (op == SR_OP_CREATED) {
+-        /* switch to the new value */
+-        sub->replay = 1;
+-    } else if (op == SR_OP_DELETED) {
+-        /* clear replay */
+-        sub->replay = 0;
+-        sub->srsn_params.start_time.tv_sec = 0;
+-        sub->srsn_params.start_time.tv_nsec = 0;
+-    }
+-
+-    if (op == SR_OP_CREATED) {
+-        /* we need to check that at least 1 mod in the stream supports replay, otherwise this is an invalid subscription config */
+-        if ((rc = stream_supports_replay(notifd_ctx, sub->srsn_params.stream, sub->srsn_params.xpath_filter, &replay_start_time))) {
+-            SRNTF_LOG_ERR("Stream \"%s\" does not support replay, cannot enable replay for subscription ID %" PRIu32 ".",
+-                    sub->srsn_params.stream, sub->id);
+-            sub->modif_err_reason = "ietf-subscribed-notifications:stream-unavailable";
+-            goto cleanup;
+-        }
+-
+-        sub->srsn_params.start_time = replay_start_time;
+-
+-        /* mark sub as modified so we know to send subscription-modified notification + resubscribe to apply replay */
+-        sub->modified = 1;
+-        sub->resubscribe = 1;
+-    }
+-
+-cleanup:
+-    if (rc) {
+-        sub_invalidate(sub, NULL);
+-    }
+-    return rc;
+-}
+-
+ int
+ handle_purpose(notif_sub_t *sub, const struct lyd_node *node, sr_change_oper_t op)
+ {
+@@ -1107,27 +1016,43 @@ cleanup:
+  */
+ 
+ /**
+- * @brief Parse the target of a subscription, replacing the current one.
++ * @brief Free the target of a subscription and reset its parameters.
++ *
++ * @param[in,out] sub Subscription to use.
++ */
++static void
++subscription_target_free(notif_sub_t *sub)
++{
++    free(sub->srsn_params.stream);
++    sub->srsn_params.stream = NULL;
++    free(sub->srsn_params.xpath_filter);
++    sub->srsn_params.xpath_filter = NULL;
++    memset(&sub->srsn_params.start_time, 0, sizeof sub->srsn_params.start_time);
++    sub->srsn_params.ds = 0;
++    sub->srsn_params.period = 0;
++    memset(&sub->srsn_params.anchor_time, 0, sizeof sub->srsn_params.anchor_time);
++
++    free(sub->filter_ref);
++    sub->filter_ref = NULL;
++    sub->replay = 0;
++    memset(&sub->replay_start_time, 0, sizeof sub->replay_start_time);
++}
++
++/**
++ * @brief Parse the event stream target of a subscription.
+  *
+  * @param[in] notifd_ctx Daemon context.
+- * @param[in,out] sub Subscription to update.
++ * @param[in,out] sub Subscription to update, its target is already freed.
+  * @param[in] sub_node Subscription list node.
+  * @return ::SR_ERR_OK on success, error code on failure.
+  */
+ static int
+-subscription_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *sub_node)
++subscription_stream_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *sub_node)
+ {
+     int rc = SR_ERR_OK;
+-    struct lyd_node *n, *filter;
++    struct lyd_node *n;
+ 
+-    free(sub->srsn_params.stream);
+-    sub->srsn_params.stream = NULL;
+-    free(sub->filter_ref);
+-    sub->filter_ref = NULL;
+-    free(sub->srsn_params.xpath_filter);
+-    sub->srsn_params.xpath_filter = NULL;
+-    sub->replay = 0;
+-    memset(&sub->srsn_params.start_time, 0, sizeof sub->srsn_params.start_time);
++    sub->srsn_params.type = SRSN_SUB_NOTIF;
+ 
+     /* stream */
+     if ((rc = get_descendant_mandatory(sub_node, "stream", &n))) {
+@@ -1136,54 +1061,126 @@ subscription_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const
+     sub->srsn_params.stream = strdup(lyd_get_value(n));
+     CHECK_ERRMEM_GOTO(sub->srsn_params.stream, rc, cleanup);
+ 
+-    /* stream-filter-name */
++    /* stream filter, by reference or in the subscription */
+     get_descendant_optional(sub_node, "stream-filter-name", &n);
+     if (n) {
+-        /* dup the referenced filter name */
+         sub->filter_ref = strdup(lyd_get_value(n));
+         CHECK_ERRMEM_GOTO(sub->filter_ref, rc, cleanup);
+ 
+-        /* get the xpath filter from the referenced stream filter (if any, it's a leafref, not instanceref) */
+-        if ((rc = stream_filter_xpath_get(notifd_ctx->sr_sess, sub->filter_ref, &sub->srsn_params.xpath_filter))) {
++        /* the referenced filter may not exist, it is a leafref, not an instance-identifier */
++        rc = filter_xpath_get(notifd_ctx->sr_sess, NOTIF_FILTER_TYPE_STREAM, sub->filter_ref,
++                &sub->srsn_params.xpath_filter);
++    } else {
++        rc = filter_from_node(notifd_ctx->sr_sess, sub_node, NOTIF_FILTER_TYPE_STREAM, &sub->srsn_params.xpath_filter);
++    }
++    if (rc) {
++        goto cleanup;
++    }
++
++    /* configured-replay, from the earliest notification the stream can replay */
++    get_descendant_optional(sub_node, "configured-replay", &n);
++    if (n) {
++        if ((rc = stream_supports_replay(notifd_ctx, sub->srsn_params.stream, sub->srsn_params.xpath_filter,
++                &sub->srsn_params.start_time))) {
++            SRNTF_LOG_ERR("Stream \"%s\" does not support replay, cannot enable replay for subscription ID %" PRIu32 ".",
++                    sub->srsn_params.stream, sub->id);
++            sub->modif_err_reason = "ietf-subscribed-notifications:stream-unavailable";
+             goto cleanup;
+         }
++        sub->replay = 1;
+     }
+ 
+-    /* subtree filter */
+-    get_descendant_optional(sub_node, "stream-subtree-filter", &n);
+-    if (n) {
+-        /* get the first child of the anydata stream-subtree-filter node, which is the first actual filter sibling */
+-        filter = lyd_child_any(n);
+-        if (filter) {
+-            /* filter exists, convert it to an xpath filter */
+-            if ((rc = sr_filter_subtree2xpath(notifd_ctx->sr_sess, filter, 1, &sub->srsn_params.xpath_filter))) {
++cleanup:
++    return rc;
++}
++
++/**
++ * @brief Parse the datastore target and the update policy of a yang-push subscription.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in,out] sub Subscription to update, its target is already freed.
++ * @param[in] sub_node Subscription list node.
++ * @param[in] ds_node Datastore leaf.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++subscription_ds_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *sub_node,
++        const struct lyd_node *ds_node)
++{
++    int rc = SR_ERR_OK;
++    struct lyd_node *n, *periodic;
++
++    /* update trigger */
++    get_descendant_optional(sub_node, "ietf-yang-push:periodic", &periodic);
++    if (periodic) {
++        sub->srsn_params.type = SRSN_YANG_PUSH_PERIODIC;
++        if ((rc = get_descendant_mandatory(periodic, "period", &n))) {
++            goto cleanup;
++        }
++        sub->srsn_params.period = strtoul(lyd_get_value(n), NULL, 10);
++        get_descendant_optional(periodic, "anchor-time", &n);
++        if (n) {
++            if (ly_time_str2ts(lyd_get_value(n), &sub->srsn_params.anchor_time)) {
++                rc = SR_ERR_LY;
+                 goto cleanup;
+             }
+         }
++    } else {
++        SRNTF_LOG_ERR("Subscription ID %" PRIu32 " has no supported update trigger.", sub->id);
++        rc = SR_ERR_UNSUPPORTED;
++        goto cleanup;
+     }
+ 
+-    /* xpath filter */
+-    get_descendant_optional(sub_node, "stream-xpath-filter", &n);
+-    if (n) {
+-        sub->srsn_params.xpath_filter = strdup(lyd_get_value(n));
+-        CHECK_ERRMEM_GOTO(sub->srsn_params.xpath_filter, rc, cleanup);
++    /* datastore */
++    if ((rc = notif_ds_from_identity(lyd_get_value(ds_node), &sub->srsn_params.ds))) {
++        SRNTF_LOG_ERR("Datastore \"%s\" of subscription ID %" PRIu32 " is not supported.", lyd_get_value(ds_node),
++                sub->id);
++        goto cleanup;
+     }
+ 
+-    /* configured-replay, from the earliest notification the stream can replay */
+-    get_descendant_optional(sub_node, "configured-replay", &n);
++    /* selection filter, by reference or in the subscription */
++    get_descendant_optional(sub_node, "ietf-yang-push:selection-filter-ref", &n);
+     if (n) {
+-        if ((rc = stream_supports_replay(notifd_ctx, sub->srsn_params.stream, sub->srsn_params.xpath_filter, &sub->srsn_params.start_time))) {
+-            SRNTF_LOG_ERR("Stream \"%s\" does not support replay, cannot enable replay for subscription ID %" PRIu32 ".",
+-                    sub->srsn_params.stream, sub->id);
+-            goto cleanup;
+-        }
+-        sub->replay = 1;
++        sub->filter_ref = strdup(lyd_get_value(n));
++        CHECK_ERRMEM_GOTO(sub->filter_ref, rc, cleanup);
++        rc = filter_xpath_get(notifd_ctx->sr_sess, NOTIF_FILTER_TYPE_DATASTORE, sub->filter_ref,
++                &sub->srsn_params.xpath_filter);
++    } else {
++        rc = filter_from_node(notifd_ctx->sr_sess, sub_node, NOTIF_FILTER_TYPE_DATASTORE,
++                &sub->srsn_params.xpath_filter);
+     }
+ 
+ cleanup:
+     return rc;
+ }
+ 
++/**
++ * @brief Parse the target of a subscription, replacing the current one.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in,out] sub Subscription to update.
++ * @param[in] sub_node Subscription list node.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++subscription_target_from_node(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, const struct lyd_node *sub_node)
++{
++    int rc;
++    struct lyd_node *ds_node;
++
++    subscription_target_free(sub);
++
++    /* the target choice, the datastore case belongs to ietf-yang-push */
++    get_descendant_optional(sub_node, "ietf-yang-push:datastore", &ds_node);
++    if (ds_node) {
++        rc = subscription_ds_target_from_node(notifd_ctx, sub, sub_node, ds_node);
++    } else {
++        rc = subscription_stream_target_from_node(notifd_ctx, sub, sub_node);
++    }
++
++    return rc;
++}
++
+ /**
+  * @brief Parse a subscription.
+  *
+@@ -1337,9 +1334,7 @@ subscription_destroy(notifd_ctx_t *notifd_ctx, notif_sub_t *sub)
+     LYA_FREE(sub->receivers);
+ 
+     /* free members */
+-    free(sub->srsn_params.stream);
+-    free(sub->srsn_params.xpath_filter);
+-    free(sub->filter_ref);
++    subscription_target_free(sub);
+     free(sub->purpose);
+     free(sub->local_address);
+ 
+@@ -1623,6 +1618,38 @@ receiver_instance_destroy_from_node(notifd_ctx_t *notifd_ctx, const struct lyd_n
+  * ---------------------------------------------------------------------------
+  */
+ 
++/**
++ * @brief Parse the target and the update policy of a subscription again from the stored configuration.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in,out] sub Subscription to update.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++subscription_target_reparse(notifd_ctx_t *notifd_ctx, notif_sub_t *sub)
++{
++    int rc = SR_ERR_OK;
++    char path[128];
++    sr_data_t *data = NULL;
++    struct lyd_node *sub_node;
++
++    snprintf(path, sizeof path, "/ietf-subscribed-notifications:subscriptions/subscription[id='%" PRIu32 "']", sub->id);
++    if ((rc = sr_get_data(notifd_ctx->sr_sess, path, 0, 0, 0, &data))) {
++        goto cleanup;
++    }
++    if (!data || lyd_find_path(data->tree, path, 0, &sub_node)) {
++        SRNTF_LOG_ERR("Configuration of subscription ID %" PRIu32 " not found.", sub->id);
++        rc = SR_ERR_NOT_FOUND;
++        goto cleanup;
++    }
++
++    rc = subscription_target_from_node(notifd_ctx, sub, sub_node);
++
++cleanup:
++    sr_release_data(data);
++    return rc;
++}
++
+ void
+ process_modified_subscriptions(notifd_ctx_t *notifd_ctx)
+ {
+@@ -1634,13 +1661,21 @@ process_modified_subscriptions(notifd_ctx_t *notifd_ctx)
+     LYA_FOR_EACH(notifd_ctx->subs, sub) {
+         resubscribed = 0;
+         if ((*sub)->resubscribe) {
+-            /* stop the srsn subscriptions and start new ones with the new params */
+-            (*sub)->state = NOTIF_SUB_STATE_VALID;
+-            LYA_FOR_EACH((*sub)->receivers, receiver) {
+-                notif_receiver_srsn_stop(notifd_ctx, receiver);
+-                notif_receiver_srsn_start(notifd_ctx, receiver);
++            if (!subscription_target_reparse(notifd_ctx, *sub)) {
++                /* stop the srsn subscriptions and start new ones with the new params */
++                (*sub)->state = NOTIF_SUB_STATE_VALID;
++                LYA_FOR_EACH((*sub)->receivers, receiver) {
++                    notif_receiver_srsn_stop(notifd_ctx, receiver);
++                    notif_receiver_srsn_start(notifd_ctx, receiver);
++                }
++                resubscribed = 1;
++            } else {
++                /* not resubscribed, the srsn subscriptions of the old target are not used anymore */
++                sub_invalidate(*sub, NULL);
++                LYA_FOR_EACH((*sub)->receivers, receiver) {
++                    notif_receiver_srsn_stop(notifd_ctx, receiver);
++                }
+             }
+-            resubscribed = 1;
+             (*sub)->resubscribe = 0;
+         }
+ 
+@@ -1697,60 +1732,62 @@ process_modified_receiver_instances(notifd_ctx_t *notifd_ctx)
+  */
+ 
+ int
+-handle_filter(notifd_ctx_t *notifd_ctx, const struct lyd_node *node, int is_subtree)
++handle_filter(notifd_ctx_t *notifd_ctx, const struct lyd_node *node, notif_filter_type_t type)
+ {
+-    int rc = SR_ERR_OK, r;
+-    const char *filter_inst_name = NULL;
++    int rc = SR_ERR_OK;
++    const char *filter_name, *xpath_filter;
+     notif_sub_t **sub;
+-    struct lyd_node *filter_inst_name_node;
++    struct lyd_node *name_node;
++    notif_filter_type_t sub_type;
+     char *new_filter = NULL;
+ 
+     /* get the key of the filter instance list, by which the subs reference this filter */
+-    if ((rc = get_descendant_mandatory(lyd_parent(node), "name", &filter_inst_name_node))) {
++    if (type == NOTIF_FILTER_TYPE_STREAM) {
++        rc = get_descendant_mandatory(lyd_parent(node), "name", &name_node);
++    } else {
++        rc = get_descendant_mandatory(lyd_parent(node), "filter-id", &name_node);
++    }
++    if (rc) {
+         return rc;
+     }
+-    filter_inst_name = lyd_get_value(filter_inst_name_node);
++    filter_name = lyd_get_value(name_node);
++
++    /* the filter as it is configured now */
++    rc = filter_xpath_get(notifd_ctx->sr_sess, type, filter_name, &new_filter);
+ 
+-    /* find the sub(s) that reference this filter and update their xpath_filter */
+     LYA_FOR_EACH(notifd_ctx->subs, sub) {
+-        r = 0;
+-        if ((*sub)->filter_ref && !strcmp((*sub)->filter_ref, filter_inst_name)) {
+-            /* match */
+-            if (is_subtree) {
+-                /* subtree filter reference, convert to xpath, subtree is anydata, so use lyd_child_any() to get it */
+-                if ((r = sr_filter_subtree2xpath(notifd_ctx->sr_sess, lyd_child_any(node), 1, &new_filter))) {
+-                    (*sub)->modif_err_reason = "ietf-subscribed-notifications:no-such-subscription";
+-                    rc = r;
+-                }
+-            } else {
+-                /* xpath filter reference, just dup the value */
+-                new_filter = strdup(lyd_get_value(node));
+-                if (!new_filter) {
+-                    r = rc = SR_ERR_NO_MEMORY;
+-                    (*sub)->modif_err_reason = "ietf-subscribed-notifications:no-such-subscription";
+-                }
+-            }
++        /* the filter names of both types share filter_ref */
++        if ((*sub)->srsn_params.type == SRSN_SUB_NOTIF) {
++            sub_type = NOTIF_FILTER_TYPE_STREAM;
++        } else {
++            sub_type = NOTIF_FILTER_TYPE_DATASTORE;
++        }
++        if ((sub_type != type) || !(*sub)->filter_ref || strcmp((*sub)->filter_ref, filter_name)) {
++            continue;
++        }
+ 
+-            if (r) {
+-                /* we failed to convert the filter, err reason was set */
+-                continue;
+-            }
++        if (rc) {
++            /* we failed to get the filter */
++            (*sub)->modif_err_reason = "ietf-subscribed-notifications:no-such-subscription";
++            continue;
++        }
+ 
+-            if ((!new_filter && (*sub)->srsn_params.xpath_filter) || (new_filter && !(*sub)->srsn_params.xpath_filter) ||
+-                    (new_filter && (*sub)->srsn_params.xpath_filter && strcmp(new_filter, (*sub)->srsn_params.xpath_filter))) {
+-                /* the filter was actually modified, update it and mark the sub for resubscription */
+-                free((*sub)->srsn_params.xpath_filter);
+-                (*sub)->srsn_params.xpath_filter = new_filter;
+-                (*sub)->modified = 1;
+-                (*sub)->resubscribe = 1;
+-            } else {
+-                /* the filter was not actually modified, just free the new filter if it was created */
+-                free(new_filter);
+-            }
+-            new_filter = NULL;
++        xpath_filter = (*sub)->srsn_params.xpath_filter;
++        if (!new_filter && !xpath_filter) {
++            /* still no filter */
++            continue;
++        }
++        if (new_filter && xpath_filter && !strcmp(new_filter, xpath_filter)) {
++            /* the same filter */
++            continue;
+         }
++
++        /* the filter was modified, the resubscription parses the target again */
++        (*sub)->modified = 1;
++        (*sub)->resubscribe = 1;
+     }
+ 
++    free(new_filter);
+     return rc;
+ }
+ 
+@@ -1868,6 +1905,178 @@ cleanup:
+     return rc;
+ }
+ 
++/**
++ * @brief Validate the XPath of a datastore selection filter, it must select existing schema nodes.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in] session Implicit session.
++ * @param[in] event Sysrepo event.
++ * @param[in] xpath_filter XPath of the filter.
++ * @return SR_ERR_OK if valid, error code otherwise.
++ */
++static int
++sub_change_validate_selection_xpath(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_event_t event,
++        const char *xpath_filter)
++{
++    int rc = SR_ERR_OK;
++    const struct ly_ctx *ly_ctx;
++    struct ly_set *set = NULL;
++
++    /* a filter with nodes that do not exist would select nothing, silently */
++    ly_ctx = sr_session_acquire_context(notifd_ctx->sr_sess);
++    if (lys_find_xpath_atoms(ly_ctx, NULL, xpath_filter, LYS_FIND_NO_MATCH_ERROR, &set)) {
++        SRNTF_VALIDATE_ERR(session, event, SR_ERR_VALIDATION_FAILED, "Selection filter \"%s\" is invalid.",
++                xpath_filter);
++        rc = SR_ERR_VALIDATION_FAILED;
++    }
++    sr_session_release_context(notifd_ctx->sr_sess);
++
++    ly_set_free(set, NULL);
++    return rc;
++}
++
++/**
++ * @brief Validate a datastore selection filter.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in] session Implicit session.
++ * @param[in] event Sysrepo event.
++ * @param[in] filter The datastore-subtree-filter or datastore-xpath-filter node.
++ * @return SR_ERR_OK if valid, error code otherwise.
++ */
++static int
++sub_change_validate_selection(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_event_t event,
++        const struct lyd_node *filter)
++{
++    int rc = SR_ERR_OK;
++    char *xpath_filter = NULL;
++
++    if (!strcmp(LYD_NAME(filter), "datastore-xpath-filter")) {
++        /* an xpath filter as is */
++        rc = sub_change_validate_selection_xpath(notifd_ctx, session, event, lyd_get_value(filter));
++        goto cleanup;
++    }
++
++    /* a subtree filter converted to xpath first */
++    if (!lyd_child_any(filter)) {
++        SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Empty datastore subtree filter selects nothing.");
++        rc = SR_ERR_UNSUPPORTED;
++        goto cleanup;
++    }
++    if ((rc = sr_filter_subtree2xpath(session, lyd_child_any(filter), 0, &xpath_filter))) {
++        SRNTF_VALIDATE_ERR(session, event, rc, "Failed to convert subtree filter to XPath.");
++        goto cleanup;
++    }
++    rc = sub_change_validate_selection_xpath(notifd_ctx, session, event, xpath_filter);
++
++cleanup:
++    free(xpath_filter);
++    return rc;
++}
++
++/**
++ * @brief Validate the datastore target and the update policy of a subscription.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in] session Implicit session, gets the new data.
++ * @param[in] event Sysrepo event.
++ * @param[in] sub_node Subscription list node with all its descendants.
++ * @return SR_ERR_OK if valid or not a datastore subscription, error code otherwise.
++ */
++static int
++sub_change_validate_datastore(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_event_t event,
++        const struct lyd_node *sub_node)
++{
++    int rc = SR_ERR_OK;
++    struct lyd_node *n, *policy;
++    sr_datastore_t ds;
++    char *xpath_filter = NULL;
++    uint64_t period;
++
++    get_descendant_optional(sub_node, "ietf-yang-push:datastore", &n);
++    if (!n) {
++        /* a stream subscription */
++        goto cleanup;
++    }
++    if (notif_ds_from_identity(lyd_get_value(n), &ds)) {
++        SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Datastore \"%s\" is not supported.", lyd_get_value(n));
++        rc = SR_ERR_UNSUPPORTED;
++        goto cleanup;
++    }
++
++    /* update trigger, the choice is not mandatory; the period is in centiseconds, SRSN takes milliseconds */
++    get_descendant_optional(sub_node, "ietf-yang-push:periodic", &policy);
++    if (policy) {
++        get_descendant_optional(policy, "period", &n);
++        period = n ? strtoull(lyd_get_value(n), NULL, 10) : 0;
++        if (!period || (period > UINT32_MAX / 10)) {
++            SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Period \"%s\" is not supported.",
++                    n ? lyd_get_value(n) : "");
++            rc = SR_ERR_UNSUPPORTED;
++            goto cleanup;
++        }
++    } else {
++        SRNTF_VALIDATE_ERR(session, event, SR_ERR_UNSUPPORTED, "Datastore subscription without a supported update "
++                "trigger.");
++        rc = SR_ERR_UNSUPPORTED;
++        goto cleanup;
++    }
++
++    /* the selection filter, by reference or in the subscription */
++    get_descendant_optional(sub_node, "ietf-yang-push:selection-filter-ref", &n);
++    if (n) {
++        if ((rc = filter_xpath_get(session, NOTIF_FILTER_TYPE_DATASTORE, lyd_get_value(n), &xpath_filter))) {
++            SRNTF_VALIDATE_ERR(session, event, rc, "Failed to get selection filter \"%s\".", lyd_get_value(n));
++            goto cleanup;
++        }
++        if (xpath_filter && (rc = sub_change_validate_selection_xpath(notifd_ctx, session, event, xpath_filter))) {
++            goto cleanup;
++        }
++    }
++    get_descendant_optional(sub_node, "ietf-yang-push:datastore-subtree-filter", &n);
++    if (!n) {
++        get_descendant_optional(sub_node, "ietf-yang-push:datastore-xpath-filter", &n);
++    }
++    if (n && (rc = sub_change_validate_selection(notifd_ctx, session, event, n))) {
++        goto cleanup;
++    }
++
++cleanup:
++    free(xpath_filter);
++    return rc;
++}
++
++/**
++ * @brief Validate the datastore target and the update policy of a modified subscription.
++ *
++ * @param[in] notifd_ctx Daemon context.
++ * @param[in] session Implicit session, gets the new data.
++ * @param[in] event Sysrepo event.
++ * @param[in] sub Modified subscription.
++ * @return SR_ERR_OK if valid or not a datastore subscription, error code otherwise.
++ */
++static int
++sub_change_validate_datastore_modified(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_event_t event,
++        const notif_sub_t *sub)
++{
++    int rc = SR_ERR_OK;
++    char path[128];
++    sr_data_t *data = NULL;
++    struct lyd_node *sub_node;
++
++    snprintf(path, sizeof path, "/ietf-subscribed-notifications:subscriptions/subscription[id='%" PRIu32 "']", sub->id);
++    if ((rc = sr_get_data(session, path, 0, 0, 0, &data))) {
++        goto cleanup;
++    }
++    if (data && !lyd_find_path(data->tree, path, 0, &sub_node)) {
++        rc = sub_change_validate_datastore(notifd_ctx, session, event, sub_node);
++    }
++
++cleanup:
++    sr_release_data(data);
++    return rc;
++}
++
+ /**
+  * @brief Validate that a receiver instance uses the transport of the subscription referencing it.
+  *
+@@ -1913,7 +2122,7 @@ sub_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_even
+     const char *stream, *xpath_filter;
+     struct timespec stop_time, start_time;
+     uint32_t i;
+-    notif_sub_t *sub;
++    notif_sub_t *sub, *ds_checked_sub = NULL;
+     const notif_transport_ops_t *ops;
+ 
+     /* validate created subscriptions */
+@@ -1991,6 +2200,12 @@ sub_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_even
+             }
+         }
+ 
++        /* the datastore target and the update policy */
++        if ((r = sub_change_validate_datastore(notifd_ctx, session, event, node))) {
++            rc = r;
++            goto cleanup;
++        }
++
+         /* temporal constraints */
+         stop_time.tv_sec = 0;
+         stop_time.tv_nsec = 0;
+@@ -2036,12 +2251,6 @@ sub_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_even
+     while (!sr_get_change_tree_next(session, iter, &op, &node, &prev_value, &prev_list, &prev_dflt)) {
+         node_name = LYD_NAME(node);
+ 
+-        /* skip non-created/modified ops, except for encoding deletion which needs default validation */
+-        if ((op != SR_OP_CREATED) && (op != SR_OP_MODIFIED) &&
+-                !((op == SR_OP_DELETED) && !strcmp(node_name, "encoding"))) {
+-            continue;
+-        }
+-
+         /* validate only the changes of the subscriptions serviced by this daemon; the diff of
+          * a modified subscription does not include its "transport" leaf, so it is the tracked
+          * state that decides here (see ::notif_transport_find_by_sub_node()) */
+@@ -2049,6 +2258,23 @@ sub_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_even
+             continue;
+         }
+ 
++        if ((sub != ds_checked_sub) && (!strcmp(node->schema->module->name, "ietf-yang-push") ||
++                !strcmp(node_name, "stream"))) {
++            /* the datastore target or the update policy changed by any operation, or the target case, validate
++             * the new one once, the changes of a subscription come one after another */
++            ds_checked_sub = sub;
++            if ((r = sub_change_validate_datastore_modified(notifd_ctx, session, event, sub))) {
++                rc = r;
++                goto cleanup;
++            }
++        }
++
++        /* skip non-created/modified ops, except for encoding deletion which needs default validation */
++        if ((op != SR_OP_CREATED) && (op != SR_OP_MODIFIED) &&
++                !((op == SR_OP_DELETED) && !strcmp(node_name, "encoding"))) {
++            continue;
++        }
++
+         if (!strcmp(node_name, "stream")) {
+             /* stream changed - validate new stream exists */
+             if ((r = sub_change_validate_stream(notifd_ctx, session, event, lyd_get_value(node), NULL))) {
+@@ -2139,9 +2365,7 @@ filter_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_e
+     const struct lyd_node *node;
+     const char *prev_value, *prev_list, *node_name;
+ 
+-    (void)notifd_ctx;
+-
+-    if ((rc = sr_get_changes_iter(session, "/ietf-subscribed-notifications:filters/stream-filter//.", &iter))) {
++    if ((rc = sr_get_changes_iter(session, "/ietf-subscribed-notifications:filters//.", &iter))) {
+         goto cleanup;
+     }
+     while (!sr_get_change_tree_next(session, iter, &op, &node, &prev_value, &prev_list, &prev_dflt)) {
+@@ -2151,11 +2375,17 @@ filter_change_validate(notifd_ctx_t *notifd_ctx, sr_session_ctx_t *session, sr_e
+ 
+         node_name = LYD_NAME(node);
+ 
++        /* a stream filter evaluates to a boolean, a selection filter selects the nodes */
+         if (!strcmp(node_name, "stream-subtree-filter")) {
+-            if ((r = sub_change_validate_subtree_filter(session, event, node))) {
+-                rc = r;
+-                goto cleanup;
+-            }
++            r = sub_change_validate_subtree_filter(session, event, node);
++        } else if (!strcmp(node_name, "datastore-subtree-filter") || !strcmp(node_name, "datastore-xpath-filter")) {
++            r = sub_change_validate_selection(notifd_ctx, session, event, node);
++        } else {
++            r = SR_ERR_OK;
++        }
++        if (r) {
++            rc = r;
++            goto cleanup;
+         }
+     }
+ 
+diff --git a/src/executables/sysrepo-notifd/notifd_control.c b/src/executables/sysrepo-notifd/notifd_control.c
+index c3206068..5676b786 100644
+--- a/src/executables/sysrepo-notifd/notifd_control.c
++++ b/src/executables/sysrepo-notifd/notifd_control.c
+@@ -176,6 +176,45 @@ cleanup_unlock:
+     return taken;
+ }
+ 
++/**
++ * @brief Subscribe an srsn subscription.
++ *
++ * @param[in] sess Session of the srsn subscriptions.
++ * @param[in] p Parameters of the subscription.
++ * @param[out] replay_start_time Actual replay start time of an event stream subscription.
++ * @param[out] fd Notification pipe read end.
++ * @param[out] srsn_sub_id srsn subscription ID.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++notifd_ctl_srsn_subscribe(sr_session_ctx_t *sess, const notif_srsn_params_t *p, struct timespec *replay_start_time,
++        int *fd, uint32_t *srsn_sub_id)
++{
++    const struct timespec *stop_time, *start_time, *anchor_time;
++    int r = SR_ERR_INTERNAL;
++
++    stop_time = (p->stop_time.tv_sec || p->stop_time.tv_nsec) ? &p->stop_time : NULL;
++    start_time = (p->start_time.tv_sec || p->start_time.tv_nsec) ? &p->start_time : NULL;
++    anchor_time = (p->anchor_time.tv_sec || p->anchor_time.tv_nsec) ? &p->anchor_time : NULL;
++
++    switch (p->type) {
++    case SRSN_SUB_NOTIF:
++        r = srsn_subscribe(sess, p->stream, p->xpath_filter, stop_time, start_time, 0, NULL, replay_start_time, fd,
++                srsn_sub_id);
++        break;
++    case SRSN_YANG_PUSH_PERIODIC:
++        /* the period is in centiseconds */
++        r = srsn_yang_push_periodic(sess, p->ds, p->xpath_filter, p->period * 10, anchor_time, stop_time, fd,
++                srsn_sub_id);
++        break;
++    case SRSN_YANG_PUSH_ON_CHANGE:
++        r = SR_ERR_UNSUPPORTED;
++        break;
++    }
++
++    return r;
++}
++
+ /**
+  * @brief Find the receiver being started.
+  *
+@@ -208,19 +247,14 @@ notifd_ctl_starting_find(notifd_ctx_t *notifd_ctx)
+ static void
+ notifd_ctl_start(notifd_ctx_t *notifd_ctx, const notif_srsn_params_t *params)
+ {
+-    const struct timespec *stop_time, *start_time;
+     struct timespec replay_start_time = {0};
+     uint32_t srsn_sub_id = 0;
+     notif_sub_t *sub;
+     notif_receiver_t *receiver;
+     int r, fd = -1;
+ 
+-    stop_time = (params->stop_time.tv_sec || params->stop_time.tv_nsec) ? &params->stop_time : NULL;
+-    start_time = (params->start_time.tv_sec || params->start_time.tv_nsec) ? &params->start_time : NULL;
+-
+     /* started unlocked, it may wait for a change callback */
+-    r = srsn_subscribe(notifd_ctx->control.sess, params->stream, params->xpath_filter, stop_time, start_time,
+-            0, NULL, &replay_start_time, &fd, &srsn_sub_id);
++    r = notifd_ctl_srsn_subscribe(notifd_ctx->control.sess, params, &replay_start_time, &fd, &srsn_sub_id);
+ 
+     /* STATE WR LOCK */
+     notifd_rwlock_lock(&notifd_ctx->state_rwlock, 1, 0, __func__);
+diff --git a/src/executables/sysrepo-notifd/notifd_dispatch.c b/src/executables/sysrepo-notifd/notifd_dispatch.c
+index a4a88d6b..c5720f3c 100644
+--- a/src/executables/sysrepo-notifd/notifd_dispatch.c
++++ b/src/executables/sysrepo-notifd/notifd_dispatch.c
+@@ -458,31 +458,36 @@ notifd_disp_disconnect_ended(notifd_ctx_t *notifd_ctx)
+  * @brief Replace the SRSN subscription ID in a record generated by SRSN with the configured one.
+  *
+  * @param[in] notif Parsed notification.
+- * @param[in] sub_id Configured subscription ID.
++ * @param[in] sub Configured subscription.
+  */
+ static void
+-notifd_disp_record_id_replace(struct lyd_node *notif, uint32_t sub_id)
++notifd_disp_record_id_replace(struct lyd_node *notif, const notif_sub_t *sub)
+ {
+     struct lyd_node *id_node;
+     const char *mod_name;
+     char id_str[11];
++    int srsn_record;
+     LY_ERR lyrc;
+ 
+-    /* only the records of this module carry the subscription ID, a notification of any other may have
+-     * an unrelated "id" leaf */
++    /* only the records of these modules carry the subscription ID, a notification of any other may have
++     * an unrelated "id" leaf; the yang-push records of a stream come from the stream, not from SRSN */
+     mod_name = notif->schema->module->name;
+-    if (strcmp(mod_name, "ietf-subscribed-notifications")) {
+-        return;
++    if (!strcmp(mod_name, "ietf-subscribed-notifications")) {
++        srsn_record = 1;
++    } else if (!strcmp(mod_name, "ietf-yang-push")) {
++        srsn_record = (sub->srsn_params.type != SRSN_SUB_NOTIF);
++    } else {
++        srsn_record = 0;
+     }
+-    if (lyd_find_path(notif, "id", 0, &id_node)) {
++    if (!srsn_record || lyd_find_path(notif, "id", 0, &id_node)) {
+         return;
+     }
+ 
+-    sprintf(id_str, "%" PRIu32, sub_id);
++    sprintf(id_str, "%" PRIu32, sub->id);
+     lyrc = lyd_change_term(id_node, id_str);
+     if (lyrc && (lyrc != LY_EEXIST)) {
+         SRNTF_LOG_WRN("Failed to replace the ID of a \"%s\" record of subscription %" PRIu32 ".", LYD_NAME(notif),
+-                sub_id);
++                sub->id);
+     }
+ }
+ 
+@@ -539,7 +544,7 @@ notifd_disp_process(notifd_ctx_t *notifd_ctx)
+             }
+             ly_in_free(in, 0);
+ 
+-            notifd_disp_record_id_replace(notif, receiver->sub->id);
++            notifd_disp_record_id_replace(notif, receiver->sub);
+             notifd_deliver_notif(notifd_ctx, receiver, notif, &disp->frames[i].timestamp);
+             lyd_free_tree(notif);
+         }
+diff --git a/src/executables/sysrepo-notifd/notifd_runtime.c b/src/executables/sysrepo-notifd/notifd_runtime.c
+index ee2a1e8d..afe7dfac 100644
+--- a/src/executables/sysrepo-notifd/notifd_runtime.c
++++ b/src/executables/sysrepo-notifd/notifd_runtime.c
+@@ -60,14 +60,123 @@ timespec_cmp(const struct timespec *ts1, const struct timespec *ts2)
+  * ---------------------------------------------------------------------------
+  */
+ 
++/**
++ * @brief Add the event stream target of a subscription to a state change notification.
++ *
++ * @param[in] tree State change notification.
++ * @param[in] sub Subscription to use.
++ * @param[in] fields Fields to add, ::NOTIF_FIELD_TARGET is used.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++subscription_state_change_notif_stream_add(struct lyd_node *tree, const notif_sub_t *sub, uint32_t fields)
++{
++    int rc = SR_ERR_OK;
++    char *start_time_str = NULL;
++
++    if (fields & NOTIF_FIELD_TARGET) {
++        if (lyd_new_path(tree, NULL, "stream", sub->srsn_params.stream, 0, NULL)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++
++        /* stream-filter-name (by-reference) or stream-xpath-filter (within-subscription, converted) */
++        if (sub->filter_ref) {
++            if (lyd_new_path(tree, NULL, "stream-filter-name", sub->filter_ref, 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        } else if (sub->srsn_params.xpath_filter) {
++            if (lyd_new_path(tree, NULL, "stream-xpath-filter", sub->srsn_params.xpath_filter, 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        }
++
++        /* replay start time */
++        if (sub->replay_start_time.tv_sec || sub->replay_start_time.tv_nsec) {
++            if (ly_time_ts2str(&sub->replay_start_time, &start_time_str)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++            if (lyd_new_path(tree, NULL, "replay-start-time", start_time_str, 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        }
++    }
++
++cleanup:
++    free(start_time_str);
++    return rc;
++}
++
++/**
++ * @brief Add the datastore target and the update policy of a yang-push subscription to a state change notification.
++ *
++ * @param[in] tree State change notification.
++ * @param[in] sub Subscription to use.
++ * @param[in] fields Fields to add, ::NOTIF_FIELD_TARGET and ::NOTIF_FIELD_UPDATE_POLICY are used.
++ * @return ::SR_ERR_OK on success, error code on failure.
++ */
++static int
++subscription_state_change_notif_yp_add(struct lyd_node *tree, const notif_sub_t *sub, uint32_t fields)
++{
++    int rc = SR_ERR_OK;
++    char buf[11], *anchor_str = NULL;
++
++    if (fields & NOTIF_FIELD_TARGET) {
++        if (lyd_new_path(tree, NULL, "ietf-yang-push:datastore", notif_ds2identity(sub->srsn_params.ds), 0, NULL)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++
++        /* selection-filter-ref (by-reference) or datastore-xpath-filter (within-subscription, converted) */
++        if (sub->filter_ref) {
++            if (lyd_new_path(tree, NULL, "ietf-yang-push:selection-filter-ref", sub->filter_ref, 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        } else if (sub->srsn_params.xpath_filter) {
++            if (lyd_new_path(tree, NULL, "ietf-yang-push:datastore-xpath-filter", sub->srsn_params.xpath_filter, 0,
++                    NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        }
++    }
++
++    if ((fields & NOTIF_FIELD_UPDATE_POLICY) && (sub->srsn_params.type == SRSN_YANG_PUSH_PERIODIC)) {
++        sprintf(buf, "%" PRIu32, sub->srsn_params.period);
++        if (lyd_new_path(tree, NULL, "ietf-yang-push:periodic/period", buf, 0, NULL)) {
++            rc = SR_ERR_LY;
++            goto cleanup;
++        }
++        if (sub->srsn_params.anchor_time.tv_sec || sub->srsn_params.anchor_time.tv_nsec) {
++            if (ly_time_ts2str(&sub->srsn_params.anchor_time, &anchor_str)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++            if (lyd_new_path(tree, NULL, "ietf-yang-push:periodic/anchor-time", anchor_str, 0, NULL)) {
++                rc = SR_ERR_LY;
++                goto cleanup;
++            }
++        }
++    }
++
++cleanup:
++    free(anchor_str);
++    return rc;
++}
++
+ static int
+ subscription_state_change_notif_new(const struct ly_ctx *ly_ctx, notif_sub_t *sub,
+         const char *notif_path, uint32_t fields, const char *reason, struct lyd_node **notif)
+ {
+     int rc = SR_ERR_OK;
+     struct lyd_node *tree = NULL;
+-    char *id_str = NULL, *stop_time_str = NULL, *start_time_str = NULL;
+-    struct timespec *start_time, *stop_time;
++    char *id_str = NULL, *stop_time_str = NULL;
++    struct timespec *stop_time;
+     notif_encoding_t encoding;
+     const notif_encoding_info_t *enc_info = NULL;
+ 
+@@ -89,30 +198,22 @@ subscription_state_change_notif_new(const struct ly_ctx *ly_ctx, notif_sub_t *su
+         goto cleanup;
+     }
+ 
+-    /* stream */
+-    if (fields & NOTIF_FIELD_STREAM) {
+-        if (lyd_new_path(tree, ly_ctx, "stream", sub->srsn_params.stream, 0, NULL)) {
+-            rc = SR_ERR_LY;
++    if (sub->srsn_params.type == SRSN_SUB_NOTIF) {
++        /* event stream target */
++        if ((rc = subscription_state_change_notif_stream_add(tree, sub, fields))) {
+             goto cleanup;
+         }
+-    }
+-
+-    /* filter: stream-filter-name (by-reference) or stream-xpath-filter (choice) */
+-    if ((fields & NOTIF_FIELD_FILTER_REF) && sub->filter_ref) {
+-        if (lyd_new_path(tree, ly_ctx, "stream-filter-name", sub->filter_ref, 0, NULL)) {
+-            rc = SR_ERR_LY;
+-            goto cleanup;
+-        }
+-    } else if ((fields & NOTIF_FIELD_XPATH_FILTER) && sub->srsn_params.xpath_filter) {
+-        if (lyd_new_path(tree, ly_ctx, "stream-xpath-filter", sub->srsn_params.xpath_filter, 0, NULL)) {
+-            rc = SR_ERR_LY;
++    } else {
++        /* datastore target and update policy */
++        if ((rc = subscription_state_change_notif_yp_add(tree, sub, fields))) {
+             goto cleanup;
+         }
+     }
+ 
+     /* stop time */
+     if (fields & NOTIF_FIELD_STOP_TIME) {
+-        stop_time = (sub->srsn_params.stop_time.tv_sec || sub->srsn_params.stop_time.tv_nsec) ? &sub->srsn_params.stop_time : NULL;
++        stop_time = (sub->srsn_params.stop_time.tv_sec || sub->srsn_params.stop_time.tv_nsec) ?
++                &sub->srsn_params.stop_time : NULL;
+         if (stop_time) {
+             if (ly_time_ts2str(stop_time, &stop_time_str)) {
+                 rc = SR_ERR_LY;
+@@ -126,22 +227,6 @@ subscription_state_change_notif_new(const struct ly_ctx *ly_ctx, notif_sub_t *su
+         }
+     }
+ 
+-    /* replay start time */
+-    if (fields & NOTIF_FIELD_REPLAY_START) {
+-        start_time = (sub->replay_start_time.tv_sec || sub->replay_start_time.tv_nsec) ?
+-                &sub->replay_start_time : NULL;
+-        if (start_time) {
+-            if (ly_time_ts2str(start_time, &start_time_str)) {
+-                rc = SR_ERR_LY;
+-                goto cleanup;
+-            }
+-            if (lyd_new_path(tree, ly_ctx, "replay-start-time", start_time_str, 0, NULL)) {
+-                rc = SR_ERR_LY;
+-                goto cleanup;
+-            }
+-        }
+-    }
+-
+     /* transport */
+     if ((fields & NOTIF_FIELD_TRANSPORT) && sub->ops) {
+         if (lyd_new_path(tree, ly_ctx, "transport", sub->ops->transport_identity, 0, NULL)) {
+@@ -189,7 +274,6 @@ cleanup:
+     lyd_free_tree(tree);
+     free(id_str);
+     free(stop_time_str);
+-    free(start_time_str);
+     return rc;
+ }
+ 
+@@ -198,8 +282,8 @@ subscription_started_notif_new(const struct ly_ctx *ly_ctx, notif_sub_t *sub, st
+ {
+     return subscription_state_change_notif_new(ly_ctx, sub,
+             "/ietf-subscribed-notifications:subscription-started",
+-            NOTIF_FIELD_STREAM | NOTIF_FIELD_XPATH_FILTER | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_REPLAY_START |
+-            NOTIF_FIELD_TRANSPORT | NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE | NOTIF_FIELD_FILTER_REF,
++            NOTIF_FIELD_TARGET | NOTIF_FIELD_UPDATE_POLICY | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_TRANSPORT |
++            NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE,
+             NULL, notif);
+ }
+ 
+@@ -218,8 +302,8 @@ subscription_modified_notif_new(const struct ly_ctx *ly_ctx, notif_sub_t *sub, s
+ {
+     return subscription_state_change_notif_new(ly_ctx, sub,
+             "/ietf-subscribed-notifications:subscription-modified",
+-            NOTIF_FIELD_STREAM | NOTIF_FIELD_XPATH_FILTER | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_REPLAY_START |
+-            NOTIF_FIELD_TRANSPORT | NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE | NOTIF_FIELD_FILTER_REF,
++            NOTIF_FIELD_TARGET | NOTIF_FIELD_UPDATE_POLICY | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_TRANSPORT |
++            NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE,
+             NULL, notif);
+ }
+ 
+@@ -293,8 +377,8 @@ subscription_started_notif_send(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, noti
+ {
+     return subscription_state_change_notif_send(notifd_ctx, sub, receiver,
+             "/ietf-subscribed-notifications:subscription-started",
+-            NOTIF_FIELD_STREAM | NOTIF_FIELD_XPATH_FILTER | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_REPLAY_START |
+-            NOTIF_FIELD_TRANSPORT | NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE | NOTIF_FIELD_FILTER_REF,
++            NOTIF_FIELD_TARGET | NOTIF_FIELD_UPDATE_POLICY | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_TRANSPORT |
++            NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE,
+             NULL, "subscription-started", 0);
+ }
+ 
+@@ -312,8 +396,8 @@ subscription_modified_notif_send(notifd_ctx_t *notifd_ctx, notif_sub_t *sub, not
+ {
+     return subscription_state_change_notif_send(notifd_ctx, sub, receiver,
+             "/ietf-subscribed-notifications:subscription-modified",
+-            NOTIF_FIELD_STREAM | NOTIF_FIELD_XPATH_FILTER | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_REPLAY_START |
+-            NOTIF_FIELD_TRANSPORT | NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE | NOTIF_FIELD_FILTER_REF,
++            NOTIF_FIELD_TARGET | NOTIF_FIELD_UPDATE_POLICY | NOTIF_FIELD_STOP_TIME | NOTIF_FIELD_TRANSPORT |
++            NOTIF_FIELD_ENCODING | NOTIF_FIELD_PURPOSE,
+             NULL, "subscription-modified", 1);
+ }
+ 
+diff --git a/src/executables/sysrepo-notifd/sysrepo-notifd.8 b/src/executables/sysrepo-notifd/sysrepo-notifd.8
+index 7ca6f37c..879a311c 100644
+--- a/src/executables/sysrepo-notifd/sysrepo-notifd.8
++++ b/src/executables/sysrepo-notifd/sysrepo-notifd.8
+@@ -17,6 +17,8 @@ sysrepo-notifd \- sysrepo notification daemon
+ It reads the \fIietf-subscribed-notifications\fP configuration and manages the
+ lifecycle of subscriptions and their receivers, delivering notifications from
+ filterable event streams over configurable transports (UDP out of the box).
++With \fIietf-yang-push\fP installed, it also implements RFC 8641 configured
++datastore subscriptions.
+ On startup it requires these three modules to be installed:
+ \fIietf-subscribed-notifications\fP, \fIietf-subscribed-notif-receivers\fP
+ and \fIietf-udp-notif-transport\fP.
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1eb76892..26463545 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -73,7 +73,7 @@ if(ENABLE_TESTS)
+ 
+     # sysrepo-notifd tests, sharing the harness in notifd/
+     set(notifd_tests test_notifd_lifecycle test_notifd_filters test_notifd_receivers test_notifd_encoding
+-        test_notifd_dispatch)
++        test_notifd_dispatch test_notifd_yang_push)
+     set(notifd_test_sources notifd/tnotifd.c notifd/tnotifd_udp.c)
+ 
+     foreach(test_name IN LISTS tests)
+diff --git a/tests/notifd/test_notifd_yang_push.c b/tests/notifd/test_notifd_yang_push.c
+new file mode 100644
+index 00000000..bf8d0d10
+--- /dev/null
++++ b/tests/notifd/test_notifd_yang_push.c
+@@ -0,0 +1,269 @@
++/**
++ * @file test_notifd_yang_push.c
++ * @author Roman Janota <Roman.Janota@cesnet.cz>
++ * @brief tests of the sysrepo-notifd configured yang-push subscriptions
++ *
++ * @copyright
++ * Copyright (c) 2026 CESNET, z.s.p.o.
++ *
++ * This source code is licensed under BSD 3-Clause License (the "License").
++ * You may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     https://opensource.org/licenses/BSD-3-Clause
++ */
++
++#define _GNU_SOURCE
++
++#include <setjmp.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include <cmocka.h>
++#include <libyang/libyang.h>
++
++#include "sysrepo.h"
++#include "tests/tcommon.h"
++#include "tnotifd.h"
++
++/** Period of the periodic subscriptions of the tests, in centiseconds */
++#define TEST_PERIOD "50"
++
++/**
++ * @brief Learn whether a printed notification includes a string.
++ *
++ * @param[in] notif Notification to print.
++ * @param[in] str String to look for.
++ * @return Whether @p str is included.
++ */
++static int
++notif_has(const struct lyd_node *notif, const char *str)
++{
++    char *printed = NULL;
++    int found;
++
++    assert_int_equal(lyd_print_mem(&printed, notif, LYD_XML, LYD_PRINT_SHRINK), LY_SUCCESS);
++    found = strstr(printed, str) ? 1 : 0;
++    free(printed);
++    return found;
++}
++
++/**
++ * @brief Wait for a push-update whose datastore contents include a string, skipping the older ones.
++ *
++ * @param[in] st Test state.
++ * @param[in] str String the printed push-update must include.
++ * @return The push-update, caller must free.
++ */
++static struct lyd_node *
++expect_push_update(struct tnotifd_state *st, const char *str)
++{
++    struct lyd_node *notif;
++    int i;
++
++    /* a few periods at most, the older data may still be pushed in the meantime */
++    for (i = 0; i < 10; ++i) {
++        notif = expect_notif(st, PUSH_UPDATE);
++        if (notif_has(notif, str)) {
++            return notif;
++        }
++        lyd_free_all(notif);
++    }
++
++    TLOG_ERR("No push-update includes \"%s\"", str);
++    fail();
++    return NULL;
++}
++
++/**
++ * @brief Test: a periodic subscription reports its datastore target and policy, pushes the data and applies a
++ * modified period.
++ */
++static void
++test_yp_periodic(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    set_node(st, "5", "/test:test-leaf");
++    apply_changes(st);
++
++    setup_ds_sub(st, 500,
++            "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf",
++            "ietf-yang-push:periodic/period", TEST_PERIOD,
++            "ietf-yang-push:periodic/anchor-time", "2026-01-01T00:00:00Z", NULL);
++
++    notif = expect_notif(st, SUB_STARTED);
++    assert_notif_leaf(notif, "id", "500");
++    assert_notif_leaf(notif, "ietf-yang-push:datastore", DS_RUNNING);
++    assert_notif_leaf(notif, "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf");
++    assert_notif_leaf(notif, "ietf-yang-push:periodic/period", TEST_PERIOD);
++    assert_int_equal(lyd_find_path(notif, "ietf-yang-push:periodic/anchor-time", 0, NULL), LY_SUCCESS);
++    assert_notif_leaf(notif, "transport", UDP_TRANSPORT);
++    assert_no_notif_leaf(notif, "stream");
++    lyd_free_all(notif);
++
++    /* the data, with the configured subscription ID */
++    notif = expect_push_update(st, "<test-leaf xmlns=\"urn:test\">5</test-leaf>");
++    assert_notif_leaf(notif, "id", "500");
++    lyd_free_all(notif);
++
++    /* every period, a changed value in a later one */
++    set_node(st, "6", "/test:test-leaf");
++    apply_changes(st);
++    lyd_free_all(expect_push_update(st, "<test-leaf xmlns=\"urn:test\">6</test-leaf>"));
++
++    /* a modified period */
++    set_node(st, "60", SUB_XP "/ietf-yang-push:periodic/period", 500);
++    apply_changes(st);
++    notif = expect_notif(st, SUB_MODIFIED);
++    assert_notif_leaf(notif, "ietf-yang-push:periodic/period", "60");
++    lyd_free_all(notif);
++    skip_notif(st, PUSH_UPDATE);
++}
++
++/**
++ * @brief Test: a selection filter by reference, and editing that filter.
++ */
++static void
++test_yp_selection_filter(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    set_node(st, "7", "/test:test-leaf");
++    set_node(st, "1", "/test:cont/l2[k='a']/v");
++    add_selection_filter(st, "sel", "/test:test-leaf");
++    setup_ds_sub(st, 502, "ietf-yang-push:selection-filter-ref", "sel",
++            "ietf-yang-push:periodic/period", TEST_PERIOD, NULL);
++
++    /* the reference is reported, not the filter */
++    notif = expect_notif(st, SUB_STARTED);
++    assert_notif_leaf(notif, "ietf-yang-push:selection-filter-ref", "sel");
++    assert_no_notif_leaf(notif, "ietf-yang-push:datastore-xpath-filter");
++    lyd_free_all(notif);
++
++    notif = expect_push_update(st, "<test-leaf xmlns=\"urn:test\">7</test-leaf>");
++    assert_false(notif_has(notif, "<l2>"));
++    lyd_free_all(notif);
++
++    /* the edited filter applies to the subscription */
++    add_selection_filter(st, "sel", "/test:cont");
++    apply_changes(st);
++    skip_notif(st, SUB_MODIFIED);
++    notif = expect_push_update(st, "<l2><k>a</k><v>1</v></l2>");
++    assert_false(notif_has(notif, "<test-leaf"));
++    lyd_free_all(notif);
++}
++
++/**
++ * @brief Test: a stream subscription switched to a datastore one.
++ */
++static void
++test_yp_stream_to_datastore(void **state)
++{
++    struct tnotifd_state *st = *state;
++    struct lyd_node *notif;
++
++    setup_sub(st, 504, "stream-xpath-filter", NCC, NULL);
++    skip_notif(st, SUB_STARTED);
++
++    set_node(st, "8", "/test:test-leaf");
++    del_node(st, SUB_XP "/stream", 504);
++    del_node(st, SUB_XP "/stream-xpath-filter", 504);
++    set_node(st, DS_RUNNING, SUB_XP "/ietf-yang-push:datastore", 504);
++    set_node(st, "/test:test-leaf", SUB_XP "/ietf-yang-push:datastore-xpath-filter", 504);
++    set_node(st, TEST_PERIOD, SUB_XP "/ietf-yang-push:periodic/period", 504);
++    apply_changes(st);
++
++    notif = expect_notif(st, SUB_MODIFIED);
++    assert_notif_leaf(notif, "ietf-yang-push:datastore", DS_RUNNING);
++    assert_no_notif_leaf(notif, "stream");
++    lyd_free_all(notif);
++
++    notif = expect_push_update(st, "<test-leaf xmlns=\"urn:test\">8</test-leaf>");
++    assert_notif_leaf(notif, "id", "504");
++    lyd_free_all(notif);
++}
++
++/**
++ * @brief Test: the datastore subscriptions that cannot be serviced are rejected.
++ */
++static void
++test_yp_validation(void **state)
++{
++    struct tnotifd_state *st = *state;
++    char stop_time_str[64];
++    time_t past;
++
++    /* no datastore for ietf-datastores:intended */
++    stage_ds_sub(st, 505, "ietf-yang-push:periodic/period", TEST_PERIOD, NULL);
++    set_node(st, "ietf-datastores:intended", SUB_XP "/ietf-yang-push:datastore", 505);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* no update trigger */
++    stage_ds_sub(st, 505, NULL);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* a period of 0 and one that does not fit in milliseconds */
++    stage_ds_sub(st, 505, "ietf-yang-push:periodic/period", "0", NULL);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++    stage_ds_sub(st, 505, "ietf-yang-push:periodic/period", "500000000", NULL);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* a filter with nodes that do not exist */
++    stage_ds_sub(st, 505, "ietf-yang-push:periodic/period", TEST_PERIOD,
++            "ietf-yang-push:datastore-xpath-filter", "/test:no-such-leaf", NULL);
++    apply_rejected(st, SR_ERR_VALIDATION_FAILED);
++
++    /* an empty subtree filter, it selects nothing */
++    stage_ds_sub(st, 505, "ietf-yang-push:periodic/period", TEST_PERIOD,
++            "ietf-yang-push:datastore-subtree-filter", NULL, NULL);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* the same for named selection filters */
++    add_selection_filter(st, "bad", "/test:no-such-leaf");
++    apply_rejected(st, SR_ERR_VALIDATION_FAILED);
++    set_node(st, NULL, SELECTION_FILTER_XP "/datastore-subtree-filter", "empty");
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* the same for a modified subscription */
++    setup_ds_sub(st, 505, "ietf-yang-push:periodic/period", TEST_PERIOD,
++            "ietf-yang-push:datastore-xpath-filter", "/test:test-leaf", NULL);
++    skip_notif(st, SUB_STARTED);
++    set_node(st, "500000000", SUB_XP "/ietf-yang-push:periodic/period", 505);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++    set_node(st, "/test:no-such-leaf", SUB_XP "/ietf-yang-push:datastore-xpath-filter", 505);
++    apply_rejected(st, SR_ERR_VALIDATION_FAILED);
++    del_node(st, SUB_XP "/ietf-yang-push:periodic", 505);
++    apply_rejected(st, SR_ERR_UNSUPPORTED);
++
++    /* a stop-time in the past, there is no replay start time to compare it with */
++    past = time(NULL) - 3600;
++    strftime(stop_time_str, sizeof stop_time_str, "%Y-%m-%dT%H:%M:%SZ", gmtime(&past));
++    set_node(st, stop_time_str, SUB_XP "/stop-time", 505);
++    apply_rejected(st, SR_ERR_VALIDATION_FAILED);
++
++    /* the subscription stays serviced */
++    assert_oper(st, "valid", SUB_XP "/configured-subscription-state", 505);
++    skip_notif(st, PUSH_UPDATE);
++}
++
++/* MAIN */
++int
++main(void)
++{
++    const struct CMUnitTest tests[] = {
++        cmocka_unit_test_setup(test_yp_periodic, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_selection_filter, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_stream_to_datastore, tnotifd_reset),
++        cmocka_unit_test_setup(test_yp_validation, tnotifd_reset),
++    };
++
++    setenv("CMOCKA_TEST_ABORT", "1", 1);
++    test_init();
++    return cmocka_run_group_tests(tests, tnotifd_setup, tnotifd_teardown);
++}
+diff --git a/tests/notifd/tnotifd.c b/tests/notifd/tnotifd.c
+index 45d7555b..e92a18fc 100644
+--- a/tests/notifd/tnotifd.c
++++ b/tests/notifd/tnotifd.c
+@@ -103,6 +103,11 @@ static const char *sub_ntf_feats[] = {
+     "configured", "xpath", "replay", "subtree", "encode-xml", "encode-json", NULL
+ };
+ 
++/** Features needed from ietf-yang-push */
++static const char *yp_feats[] = {
++    "on-change", NULL
++};
++
+ /** Modules installed for the tests, in dependency order */
+ static const struct test_module test_modules[] = {
+     {SN_YANG_DIR "/ietf-interfaces@2018-02-20.yang", NULL},
+@@ -111,6 +116,8 @@ static const struct test_module test_modules[] = {
+     {SN_YANG_DIR "/ietf-network-instance@2019-01-21.yang", NULL},
+     {SN_YANG_DIR "/ietf-restconf@2017-01-26.yang", NULL},
+     {SN_YANG_DIR "/ietf-subscribed-notifications@2019-09-09.yang", sub_ntf_feats},
++    {SN_YANG_DIR "/ietf-yang-patch@2017-02-22.yang", NULL},
++    {SN_YANG_DIR "/ietf-yang-push@2019-09-09.yang", yp_feats},
+     {SN_YANG_DIR "/ietf-subscribed-notif-receivers@2024-02-01.yang", NULL},
+     {SN_YANG_DIR "/ietf-crypto-types@2024-10-10.yang", NULL},
+     {SN_YANG_DIR "/iana-tls-cipher-suite-algs@2024-03-16.yang", NULL},
+@@ -167,6 +174,8 @@ remove_test_modules(sr_conn_ctx_t *conn)
+         "iana-tls-cipher-suite-algs",
+         "ietf-crypto-types",
+         "ietf-subscribed-notif-receivers",
++        "ietf-yang-push",
++        "ietf-yang-patch",
+         "ietf-subscribed-notifications",
+         "ietf-restconf",
+         "ietf-network-instance",
+@@ -440,6 +449,13 @@ apply_changes(struct tnotifd_state *st)
+     assert_int_equal(sr_apply_changes(st->sess, 0), SR_ERR_OK);
+ }
+ 
++void
++apply_rejected(struct tnotifd_state *st, int rc)
++{
++    assert_int_equal(sr_apply_changes(st->sess, 0), rc);
++    assert_int_equal(sr_discard_changes(st->sess), SR_ERR_OK);
++}
++
+ void
+ stage_sub(struct tnotifd_state *st, uint32_t sub_id, ...)
+ {
+@@ -479,6 +495,56 @@ setup_sub(struct tnotifd_state *st, uint32_t sub_id, ...)
+     apply_changes(st);
+ }
+ 
++void
++add_selection_filter(struct tnotifd_state *st, const char *filter_id, const char *xpath)
++{
++    set_node(st, xpath, SELECTION_FILTER_XP "/datastore-xpath-filter", filter_id);
++}
++
++/**
++ * @brief Stage the common setup of a yang-push subscription.
++ *
++ * @param[in] st Test state.
++ * @param[in] sub_id Subscription ID.
++ * @param[in] ap NULL-terminated (relative leaf path, value) pairs of extra subscription leaves.
++ */
++static void
++stage_ds_sub_va(struct tnotifd_state *st, uint32_t sub_id, va_list ap)
++{
++    char prefix[512];
++
++    add_recv_inst(st, TEST_RECV_INST, st->udp_port, NULL);
++
++    snprintf(prefix, sizeof prefix, SUB_XP, sub_id);
++    set_node(st, DS_RUNNING, "%s/ietf-yang-push:datastore", prefix);
++    set_node(st, UDP_TRANSPORT, "%s/transport", prefix);
++    set_leaves(st->sess, prefix, ap);
++
++    bind_sub_recv(st, sub_id, TEST_RECV, TEST_RECV_INST);
++}
++
++void
++stage_ds_sub(struct tnotifd_state *st, uint32_t sub_id, ...)
++{
++    va_list ap;
++
++    va_start(ap, sub_id);
++    stage_ds_sub_va(st, sub_id, ap);
++    va_end(ap);
++}
++
++void
++setup_ds_sub(struct tnotifd_state *st, uint32_t sub_id, ...)
++{
++    va_list ap;
++
++    va_start(ap, sub_id);
++    stage_ds_sub_va(st, sub_id, ap);
++    va_end(ap);
++
++    apply_changes(st);
++}
++
+ void
+ assert_notif_leaf(const struct lyd_node *notif, const char *name, const char *value)
+ {
+diff --git a/tests/notifd/tnotifd.h b/tests/notifd/tnotifd.h
+index 706a173f..7c84cbca 100644
+--- a/tests/notifd/tnotifd.h
++++ b/tests/notifd/tnotifd.h
+@@ -130,6 +130,12 @@ typedef struct {
+ /** Named stream filter xpath prefix, takes a filter name */
+ #define FILTER_XP "/ietf-subscribed-notifications:filters/stream-filter[name='%s']"
+ 
++/** Named yang-push selection filter xpath prefix, takes a filter ID */
++#define SELECTION_FILTER_XP "/ietf-subscribed-notifications:filters/ietf-yang-push:selection-filter[filter-id='%s']"
++
++/** Datastore identity of the yang-push subscriptions of the tests */
++#define DS_RUNNING "ietf-datastores:running"
++
+ /** Transport identity of every subscription created by the tests */
+ #define UDP_TRANSPORT "ietf-udp-notif-transport:udp-notif"
+ 
+@@ -147,6 +153,8 @@ typedef struct {
+ #define NCC "/ietf-netconf-notifications:netconf-config-change"
+ #define REPLAY_COMPLETED "/ietf-subscribed-notifications:replay-completed"
+ #define SUB_COMPLETED "/ietf-subscribed-notifications:subscription-completed"
++#define PUSH_UPDATE "/ietf-yang-push:push-update"
++#define PUSH_CHANGE_UPDATE "/ietf-yang-push:push-change-update"
+ 
+ /** Name of the receiver instance created by setup_sub() */
+ #define TEST_RECV_INST "test-recv"
+@@ -167,6 +175,7 @@ typedef struct {
+  *   221      restart              230      receiver inst ref    300      resolve failure
+  *   305      large notification   307      sent records         309      sigterm shutdown
+  *   310      excluded records
++ *   500-509  yang-push periodic
+  */
+ 
+ /**
+@@ -305,6 +314,14 @@ void add_subtree_filter(struct tnotifd_state *st, const char *name, const char *
+  */
+ void apply_changes(struct tnotifd_state *st);
+ 
++/**
++ * @brief Apply the staged changes, asserting they are rejected, and discard them.
++ *
++ * @param[in] st Test state.
++ * @param[in] rc Expected error.
++ */
++void apply_rejected(struct tnotifd_state *st, int rc);
++
+ /**
+  * @brief Stage the common setup: a receiver instance on the test port and a subscription on the
+  * NETCONF stream over udp-notif with a single receiver bound to it. Does not apply.
+@@ -324,6 +341,34 @@ void stage_sub(struct tnotifd_state *st, uint32_t sub_id, ...);
+  */
+ void setup_sub(struct tnotifd_state *st, uint32_t sub_id, ...);
+ 
++/**
++ * @brief Stage a named yang-push selection filter with an xpath filter.
++ *
++ * @param[in] st Test state.
++ * @param[in] filter_id Filter ID.
++ * @param[in] xpath XPath filter expression.
++ */
++void add_selection_filter(struct tnotifd_state *st, const char *filter_id, const char *xpath);
++
++/**
++ * @brief Stage the common setup of a yang-push subscription of the running datastore, like stage_sub(). Does not
++ * apply.
++ *
++ * @param[in] st Test state.
++ * @param[in] sub_id Subscription ID.
++ * @param[in] ... NULL-terminated (relative leaf path, value) pairs of extra subscription leaves, the update policy.
++ */
++void stage_ds_sub(struct tnotifd_state *st, uint32_t sub_id, ...);
++
++/**
++ * @brief Stage the common setup of a yang-push subscription with stage_ds_sub() and apply it.
++ *
++ * @param[in] st Test state.
++ * @param[in] sub_id Subscription ID.
++ * @param[in] ... NULL-terminated (relative leaf path, value) pairs of extra subscription leaves, the update policy.
++ */
++void setup_ds_sub(struct tnotifd_state *st, uint32_t sub_id, ...);
++
+ /**
+  * @brief Assert a descendant leaf of a notification exists and has a value.
+  *

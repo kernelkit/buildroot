@@ -1,0 +1,72 @@
+From eaeb2b242bc9904d11843013a4403dcf95890345 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:31:09 +0200
+Subject: [PATCH] sn BUGFIX serialize notification pipe writes
+
+writev() into a pipe is atomic only up to PIPE_BUF and a short write is
+completed by further writes. The on-change callback and the dampening
+timer were serialized by the timer lock, but a resync, suspend, resume
+or dampening modify wrote from the caller's thread without it, so a
+large push-update could be interleaved with another notification and
+the reader desynchronised.
+
+Every subscription now has a leaf lock held across the whole frame
+write.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/1fe2d1759a01c25baf3a0bd2812b64797e29fe43
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c | 13 +++++++++++--
+ src/utils/sn_common.h |  1 +
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index b7a98390..2660eb11 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -96,6 +96,7 @@ srsn_sub_new(const char *xpath_filter, const struct timespec *stop_time, sr_subs
+     s->id = srsn_new_id();
+     s->rfd = fds[0];
+     s->wfd = fds[1];
++    pthread_mutex_init(&s->write_lock, NULL);
+     if (sr_sub) {
+         /* subscription will be returned to the caller */
+         s->sr_sub = *sr_sub;
+@@ -174,6 +175,7 @@ srsn_sub_free(struct srsn_sub *sub)
+         sr_errinfo_free(&err_info);
+     }
+     pthread_cond_destroy(&sub->stop_sntimer.cond);
++    pthread_mutex_destroy(&sub->write_lock);
+     free(sub->nacm_user);
+ 
+     switch (sub->type) {
+@@ -576,8 +578,15 @@ srsn_ntf_send(struct srsn_sub *sub, const struct timespec *timestamp, const stru
+     bufs[2].iov_base = ntf_lyb;
+     bufs[2].iov_len = size;
+ 
+-    /* vector write, atomic only up to PIPE_BUF so a short write must be completed manually */
+-    if ((err_info = srsn_writev_all(sub->wfd, bufs, 3))) {
++    /* WRITE LOCK, the whole notification is written before another writer may start */
++    pthread_mutex_lock(&sub->write_lock);
++
++    err_info = srsn_writev_all(sub->wfd, bufs, 3);
++
++    /* WRITE UNLOCK */
++    pthread_mutex_unlock(&sub->write_lock);
++
++    if (err_info) {
+         goto cleanup;
+     }
+ 
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index 466083df..fda208f6 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -73,6 +73,7 @@ struct srsn_state {
+         uint32_t id;
+         int rfd;
+         int wfd;
++        pthread_mutex_t write_lock;     /**< serializes the writes into wfd, a leaf lock */
+         sr_subscription_ctx_t *sr_sub;
+         int unsub;
+         uint32_t *sr_sub_ids;

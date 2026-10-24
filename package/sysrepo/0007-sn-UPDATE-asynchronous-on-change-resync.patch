@@ -1,0 +1,401 @@
+From 8b44457f724facec4706a15849c648d224f72264 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:40:36 +0200
+Subject: [PATCH] sn UPDATE asynchronous on-change resync
+
+A resync and the sync-on-start update were sent synchronously from the
+caller's thread. A caller that is also the only reader of the pipe
+blocks on a push-update larger than the pipe, and a caller serving
+operational data waits for its own providers until they time out.
+
+Every on-change subscription now has a sync worker. A resync only
+requests a round and returns at once, it never waits for a round in
+progress. A round holds the dampening lock across getting the data, so
+every change committed after the snapshot is sent after it, and drops
+a dampened change still pending, which the update supersedes and whose
+patch ID is being reset. The sync-on-start update is requested once the
+SR subscriptions exist, so no change in between is lost.
+
+A failure to get the data is now only logged, not returned.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/efec7ad136467b1bf1af57a48dbc24db6bea39d9
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c                |   3 +
+ src/utils/sn_common.h                |   5 ++
+ src/utils/sn_yang_push.c             | 102 ++++++++++++++++++++++++++-
+ src/utils/sn_yang_push.h             |  17 +++++
+ src/utils/subscribed_notifications.c |  33 ++++-----
+ src/utils/subscribed_notifications.h |   5 +-
+ tests/test_sub_notif.c               |  65 +++++++++++++++++
+ 7 files changed, 211 insertions(+), 19 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index 99e9f61d..1591d287 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -36,6 +36,7 @@
+ #include "compat.h"
+ #include "log.h"
+ #include "ly_wrap.h"
++#include "sn_yang_push.h"
+ #include "sysrepo.h"
+ 
+ static struct srsn_state snstate = {
+@@ -148,6 +149,7 @@ srsn_sub_free_unsubscribe(struct srsn_sub *sub)
+     }
+     if (sub->type == SRSN_YANG_PUSH_ON_CHANGE) {
+         srsn_update_timer(NULL, NULL, &sub->damp_sntimer);
++        srsn_yp_sync_stop(sub);
+     }
+ }
+ 
+@@ -201,6 +203,7 @@ srsn_sub_free(struct srsn_sub *sub)
+             sr_errinfo_free(&err_info);
+         }
+         pthread_cond_destroy(&sub->damp_sntimer.cond);
++        pthread_mutex_destroy(&sub->sync_lock);
+         break;
+     }
+ 
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index b4832796..f69b033c 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -119,6 +119,11 @@ struct srsn_state {
+                 struct timespec last_notif;
+                 struct srsn_timer damp_sntimer;
+                 uint32_t excluded_change_count; /* explicitly excluded changes */
++
++                pthread_mutex_t sync_lock;      /**< guards the sync members below, a leaf lock */
++                pthread_t sync_tid;             /**< sync worker, 0 if not started or already joined */
++                int sync_running;               /**< whether the sync worker runs its rounds */
++                int sync_pending;               /**< whether another sync round was requested */
+             };
+         };
+     } **subs;
+diff --git a/src/utils/sn_yang_push.c b/src/utils/sn_yang_push.c
+index f61afcb8..83c5b1aa 100644
+--- a/src/utils/sn_yang_push.c
++++ b/src/utils/sn_yang_push.c
+@@ -99,6 +99,104 @@ cleanup:
+     return err_info;
+ }
+ 
++/**
++ * @brief Sync worker of an on-change subscription, sends a push-update for every requested round.
++ */
++static void *
++srsn_yp_sync_thread(void *arg)
++{
++    struct srsn_sub *sub = arg;
++    sr_error_info_t *err_info = NULL;
++
++    while (1) {
++        /* SYNC LOCK */
++        pthread_mutex_lock(&sub->sync_lock);
++
++        if (!sub->sync_pending) {
++            sub->sync_running = 0;
++
++            /* SYNC UNLOCK */
++            pthread_mutex_unlock(&sub->sync_lock);
++            break;
++        }
++        sub->sync_pending = 0;
++
++        /* SYNC UNLOCK */
++        pthread_mutex_unlock(&sub->sync_lock);
++
++        /* TIMER LOCK */
++        pthread_mutex_lock(&sub->damp_sntimer.lock);
++
++        /* the push-update supersedes a dampened change and restarts the patch IDs */
++        sr_release_data(sub->change_ntf);
++        sub->change_ntf = NULL;
++        srsn_yp_reset_patch_id(sub);
++
++        if ((err_info = srsn_yp_ntf_update_send(sub))) {
++            sr_errinfo_free(&err_info);
++        }
++
++        /* TIMER UNLOCK */
++        pthread_mutex_unlock(&sub->damp_sntimer.lock);
++    }
++
++    return NULL;
++}
++
++sr_error_info_t *
++srsn_yp_sync_request(struct srsn_sub *sub)
++{
++    sr_error_info_t *err_info = NULL;
++    int r;
++
++    /* SYNC LOCK */
++    pthread_mutex_lock(&sub->sync_lock);
++
++    sub->sync_pending = 1;
++    if (!sub->sync_running) {
++        if (sub->sync_tid) {
++            /* the previous worker finished its rounds, it is only returning */
++            pthread_join(sub->sync_tid, NULL);
++            sub->sync_tid = 0;
++        }
++
++        r = pthread_create(&sub->sync_tid, NULL, srsn_yp_sync_thread, sub);
++        if (r) {
++            sr_errinfo_new(&err_info, SR_ERR_SYS, "Failed to create a thread (%s).", strerror(r));
++            sub->sync_tid = 0;
++            sub->sync_pending = 0;
++        } else {
++            sub->sync_running = 1;
++        }
++    }
++
++    /* SYNC UNLOCK */
++    pthread_mutex_unlock(&sub->sync_lock);
++
++    return err_info;
++}
++
++void
++srsn_yp_sync_stop(struct srsn_sub *sub)
++{
++    pthread_t tid;
++
++    /* SYNC LOCK */
++    pthread_mutex_lock(&sub->sync_lock);
++
++    sub->sync_pending = 0;
++    tid = sub->sync_tid;
++    sub->sync_tid = 0;
++
++    /* SYNC UNLOCK */
++    pthread_mutex_unlock(&sub->sync_lock);
++
++    if (tid) {
++        /* the worker finishes the round in progress */
++        pthread_join(tid, NULL);
++    }
++}
++
+ /**
+  * @brief Timer callback for push-update notification of periodic yang-push subscriptions.
+  */
+@@ -189,8 +287,8 @@ srsn_yp_damp_timer_cb(void *arg, int *UNUSED(freed))
+     struct srsn_sub *sub = arg;
+     sr_error_info_t *err_info = NULL;
+ 
+-    /* send the postponed on-change notification */
+-    if ((err_info = srsn_yp_ntf_change_send(sub))) {
++    /* send the postponed on-change notification, unless a resync dropped it */
++    if (sub->change_ntf && (err_info = srsn_yp_ntf_change_send(sub))) {
+         sr_errinfo_free(&err_info);
+     }
+ }
+diff --git a/src/utils/sn_yang_push.h b/src/utils/sn_yang_push.h
+index d9c24e1e..48fe0dad 100644
+--- a/src/utils/sn_yang_push.h
++++ b/src/utils/sn_yang_push.h
+@@ -42,6 +42,23 @@ void srsn_yp_reset_patch_id(struct srsn_sub *sub);
+  */
+ sr_error_info_t *srsn_yp_ntf_update_send(struct srsn_sub *sub);
+ 
++/**
++ * @brief Request an asynchronous resync of a yang-push on-change subscription.
++ *
++ * @param[in] sub Subscription to resync.
++ * @return err_info, NULL on success.
++ */
++sr_error_info_t *srsn_yp_sync_request(struct srsn_sub *sub);
++
++/**
++ * @brief Stop the sync worker of a yang-push on-change subscription, a resync in progress is finished.
++ *
++ * @warning @p sub MUST be unlinked first, so that no new resync can be requested.
++ *
++ * @param[in] sub Subscription to use.
++ */
++void srsn_yp_sync_stop(struct srsn_sub *sub);
++
+ /**
+  * @brief Create a timer and schedule periodic updates of a subscription.
+  *
+diff --git a/src/utils/subscribed_notifications.c b/src/utils/subscribed_notifications.c
+index 64757c5e..53abb01e 100644
+--- a/src/utils/subscribed_notifications.c
++++ b/src/utils/subscribed_notifications.c
+@@ -359,7 +359,8 @@ srsn_yang_push_on_change(sr_session_ctx_t *session, sr_datastore_t ds, const cha
+     sr_error_info_t *err_info = NULL;
+     const struct lys_module *ly_mod;
+     struct srsn_sub *s = NULL;
+-    int valid;
++    int valid, rfd;
++    uint32_t id;
+ 
+     SR_CHECK_ARG_APIRET(!session || !fd || !sub_id, NULL, err_info);
+ 
+@@ -398,20 +399,16 @@ srsn_yang_push_on_change(sr_session_ctx_t *session, sr_datastore_t ds, const cha
+     s->patch_id = 1;
+     pthread_mutex_init(&s->damp_sntimer.lock, NULL);
+     pthread_cond_init(&s->damp_sntimer.cond, NULL);
+-
+-    /* send the initial update notification */
+-    if (sync_on_start && (err_info = srsn_yp_ntf_update_send(s))) {
+-        goto cleanup;
+-    }
++    pthread_mutex_init(&s->sync_lock, NULL);
+ 
+     /* subscribe to sysrepo module changes */
+     if ((err_info = srsn_yp_sr_subscribe(session, s, sub_no_thread))) {
+         goto cleanup;
+     }
+ 
+-    /* add into subscriptions, is not accessible before */
+-    if ((err_info = srsn_sub_add(s))) {
+-        goto cleanup;
++    /* request the initial push-update */
++    if (sync_on_start && (err_info = srsn_yp_sync_request(s))) {
++        sr_errinfo_free(&err_info);
+     }
+ 
+     /* fill out params */
+@@ -419,8 +416,15 @@ srsn_yang_push_on_change(sr_session_ctx_t *session, sr_datastore_t ds, const cha
+         /* managed by the caller now */
+         *sub = s->sr_sub;
+     }
+-    *fd = s->rfd;
+-    *sub_id = s->id;
++    rfd = s->rfd;
++    id = s->id;
++
++    /* add into subscriptions, from now on another thread may terminate and free it */
++    if ((err_info = srsn_sub_add(s))) {
++        goto cleanup;
++    }
++    *fd = rfd;
++    *sub_id = id;
+ 
+ cleanup:
+     if (err_info) {
+@@ -453,11 +457,8 @@ srsn_yang_push_on_change_resync(uint32_t sub_id)
+         goto cleanup;
+     }
+ 
+-    /* reset patch ID */
+-    srsn_yp_reset_patch_id(sub);
+-
+-    /* send the update notification */
+-    if ((err_info = srsn_yp_ntf_update_send(sub))) {
++    /* the sync worker resets the patch ID and sends the update notification */
++    if ((err_info = srsn_yp_sync_request(sub))) {
+         goto cleanup;
+     }
+ 
+diff --git a/src/utils/subscribed_notifications.h b/src/utils/subscribed_notifications.h
+index 50d704bb..4cbd0224 100644
+--- a/src/utils/subscribed_notifications.h
++++ b/src/utils/subscribed_notifications.h
+@@ -143,7 +143,8 @@ int srsn_yang_push_periodic(sr_session_ctx_t *session, sr_datastore_t ds, const
+  * @param[in] ds Datastore to subscribe to.
+  * @param[in] xpath_filter Optional XPath filter to use.
+  * @param[in] dampening_period_ms Optional notification dampening period in ms.
+- * @param[in] sync_on_start Whether to start the subscription with a full datastore content notification.
++ * @param[in] sync_on_start Whether to start the subscription with a full datastore content notification. A failure
++ * to send it is only logged.
+  * @param[in] excluded_changes Optional array of changes to be excluded. Set index of a ::srsn_yp_change_t to 1 for it
+  * to be excluded, to 0 to be included.
+  * @param[in] stop_time Optional stop-time of the subscription. Once reached, the `subscription-terminated' notification
+@@ -161,6 +162,8 @@ int srsn_yang_push_on_change(sr_session_ctx_t *session, sr_datastore_t ds, const
+ /**
+  * @brief Resync a yang-push on-change subscription.
+  *
++ * The 'push-update' notification is sent in the background, a failure to send it is only logged.
++ *
+  * @param[in] sub_id Subscription ID of the subscription to resync.
+  * @return Error code (::SR_ERR_OK on success).
+  */
+diff --git a/tests/test_sub_notif.c b/tests/test_sub_notif.c
+index d83e7785..57d63f98 100644
+--- a/tests/test_sub_notif.c
++++ b/tests/test_sub_notif.c
+@@ -789,6 +789,69 @@ test_yp_on_change_dampening(void **state)
+     assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
+ }
+ 
++/* TEST */
++static void
++test_yp_resync(void **state)
++{
++    struct state *st = *state;
++    int fd;
++    uint32_t sub_id;
++
++    /* the initial update of sync-on-start */
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change(st->sess, SR_DS_RUNNING, "/test:test-leaf", 0, 1, NULL,
++            NULL, 0, NULL, &fd, &sub_id));
++    yp_expect_notif(st, fd, 2000, "push-update", NULL);
++
++    yp_set_test_leaf(st, "1");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-1");
++    yp_set_test_leaf(st, "2");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-2");
++
++    /* the resync is sent asynchronously and restarts the patch IDs */
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change_resync(sub_id));
++    yp_expect_notif(st, fd, 2000, "push-update", NULL);
++    yp_set_test_leaf(st, "3");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-1");
++
++    /* cleanup */
++    assert_int_equal(SR_ERR_OK, srsn_terminate(sub_id, NULL));
++    close(fd);
++    assert_int_equal(SR_ERR_OK, sr_delete_item(st->sess, "/test:test-leaf", 0));
++    assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
++}
++
++/* TEST */
++static void
++test_yp_resync_dampened(void **state)
++{
++    struct state *st = *state;
++    int fd;
++    uint32_t sub_id;
++
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change(st->sess, SR_DS_RUNNING, "/test:test-leaf", 1000, 0, NULL,
++            NULL, 0, NULL, &fd, &sub_id));
++
++    /* the second change is dampened */
++    yp_set_test_leaf(st, "1");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-1");
++    yp_set_test_leaf(st, "2");
++
++    /* the resync supersedes the dampened change, which is never sent */
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change_resync(sub_id));
++    yp_expect_notif(st, fd, 2000, "push-update", NULL);
++    assert_int_equal(SR_ERR_TIME_OUT, srsn_poll(fd, 1500));
++
++    /* a later change starts the patch IDs over */
++    yp_set_test_leaf(st, "3");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-1");
++
++    /* cleanup */
++    assert_int_equal(SR_ERR_OK, srsn_terminate(sub_id, NULL));
++    close(fd);
++    assert_int_equal(SR_ERR_OK, sr_delete_item(st->sess, "/test:test-leaf", 0));
++    assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
++}
++
+ /* TEST */
+ static void
+ test_yp_on_change_no_module(void **state)
+@@ -1139,6 +1202,8 @@ main(void)
+         cmocka_unit_test(test_yp_periodic),
+         cmocka_unit_test(test_yp_on_change),
+         cmocka_unit_test(test_yp_on_change_dampening),
++        cmocka_unit_test(test_yp_resync),
++        cmocka_unit_test(test_yp_resync_dampened),
+         cmocka_unit_test(test_yp_on_change_no_module),
+         cmocka_unit_test(test_read_eof),
+         cmocka_unit_test_setup_teardown(test_nacm_sub, setup_nacm, teardown_nacm),
