@@ -4,8 +4,8 @@
 #
 ################################################################################
 
-NETOPEER2_VERSION = 2.7.0
-NETOPEER2_SITE = $(call github,CESNET,Netopeer2,v$(NETOPEER2_VERSION))
+NETOPEER2_VERSION = 2.8.21
+NETOPEER2_SITE = $(call github,CESNET,Netopeer2,$(NETOPEER2_VERSION))
 NETOPEER2_DL_SUBDIR = netopeer2
 NETOPEER2_LICENSE = BSD-3-Clause
 NETOPEER2_LICENSE_FILES = LICENSE

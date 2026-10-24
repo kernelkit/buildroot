@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-LIBYANG_VERSION = 4.2.2
+LIBYANG_VERSION = 6.4.13
 LIBYANG_SITE = $(call github,CESNET,libyang,v$(LIBYANG_VERSION))
 LIBYANG_LICENSE = BSD-3-Clause
 LIBYANG_LICENSE_FILES = LICENSE
