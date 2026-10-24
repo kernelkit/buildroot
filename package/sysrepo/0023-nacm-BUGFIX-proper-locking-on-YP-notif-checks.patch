@@ -1,0 +1,99 @@
+From dbaae415e2ddf279eda8fb590f8f59d0720ff88c Mon Sep 17 00:00:00 2001
+From: Michal Vasko <mvasko@cesnet.cz>
+Date: Fri, 16 Oct 2026 11:02:01 +0200
+Subject: [PATCH] nacm BUGFIX proper locking on YP notif checks
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/30da3ab0ea14412ffa8d126c90d8b18eeff9580c
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/subscr.c             | 11 +++++++----
+ src/utils/nacm.c         |  4 ----
+ src/utils/sn_yang_push.c |  7 ++++---
+ 3 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/src/subscr.c b/src/subscr.c
+index 85dba157..fa08caab 100644
+--- a/src/subscr.c
++++ b/src/subscr.c
+@@ -1869,7 +1869,7 @@ sr_notif_check_filter(sr_session_ctx_t *sess, struct lyd_node *notif_tree, const
+         }
+         SR_CHECK_INT_GOTO(!set->count, err_info, cleanup);
+ 
+-        /* NACM start */
++        /* NACM start and lock */
+         if ((err_info = sr_nacm_check_yp_change_begin(sess->nacm_user, &groups, &group_count))) {
+             goto cleanup;
+         }
+@@ -1881,7 +1881,7 @@ sr_notif_check_filter(sr_session_ctx_t *sess, struct lyd_node *notif_tree, const
+ 
+             /* check NACM for the target */
+             if ((err_info = sr_nacm_check_yp_change_target(sess->nacm_user, groups, group_count, target, schema, &d))) {
+-                goto cleanup;
++                goto cleanup_unlock;
+             }
+             if (d) {
+                 /* access to the path is denied, remove the edit */
+@@ -1893,14 +1893,17 @@ sr_notif_check_filter(sr_session_ctx_t *sess, struct lyd_node *notif_tree, const
+         if (den_c == set->count) {
+             /* NACM denied read access to all the edits, drop the notification */
+             *filtered_out = 1;
+-            goto cleanup;
++            goto cleanup_unlock;
+         }
+     }
+ 
++cleanup_unlock:
++    /* NACM unlock */
++    sr_nacm_check_yp_change_end(groups, group_count);
++
+ cleanup:
+     free(denied.rule_name);
+     ly_set_free(set, NULL);
+-    sr_nacm_check_yp_change_end(groups, group_count);
+     return err_info;
+ }
+ 
+diff --git a/src/utils/nacm.c b/src/utils/nacm.c
+index d148cf24..c1df816d 100644
+--- a/src/utils/nacm.c
++++ b/src/utils/nacm.c
+@@ -2435,10 +2435,6 @@ cleanup:
+ void
+ sr_nacm_check_yp_change_end(char **groups, uint32_t group_count)
+ {
+-    if (!groups) {
+-        return;
+-    }
+-
+     /* NACM UNLOCK */
+     pthread_mutex_unlock(&nacm.lock);
+ 
+diff --git a/src/utils/sn_yang_push.c b/src/utils/sn_yang_push.c
+index c23199c0..65b1d4d8 100644
+--- a/src/utils/sn_yang_push.c
++++ b/src/utils/sn_yang_push.c
+@@ -685,20 +685,21 @@ srsn_yp_on_change_cb(sr_session_ctx_t *session, uint32_t UNUSED(sub_id), const c
+ 
+     /* NACM begin */
+     if ((err_info = sr_nacm_check_yp_change_begin(sub->nacm_user, &groups, &group_count))) {
+-        goto cleanup_unlock;
++        pthread_mutex_unlock(&sub->damp_sntimer.lock);
++        goto cleanup;
+     }
+ 
+     while (!sr_get_change_tree_next(session, iter, &op, &node, &prev_value, &prev_list, NULL)) {
+         /* get the (target) node path */
+         free(node_path);
+         if ((err_info = srsn_yp_on_change_target_path(node, prev_value, &node_path))) {
+-            goto cleanup;
++            goto cleanup_unlock;
+         }
+ 
+         /* check 'target' NACM */
+         if ((err_info = sr_nacm_check_yp_change_target(sub->nacm_user, groups, group_count, node_path, node->schema,
+                 &denied))) {
+-            goto cleanup;
++            goto cleanup_unlock;
+         }
+         if (denied) {
+             continue;
