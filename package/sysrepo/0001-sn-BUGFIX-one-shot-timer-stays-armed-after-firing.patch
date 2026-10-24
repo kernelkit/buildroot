@@ -1,0 +1,182 @@
+From 3de69a3477699ca6ed2c4e4734c6606df67157a3 Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Thu, 1 Oct 2026 17:15:21 +0200
+Subject: [PATCH] sn BUGFIX one-shot timer stays armed after firing
+
+A timer without an interval never cleared its thread ID after its
+callback returned. The dampening timer of an on-change subscription
+then looked armed forever and every later change was only accumulated,
+never sent.
+
+The timer thread now detaches itself and clears the ID once a one-shot
+callback returns.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/8cfd56387706314b0f4a46293b1c0b627c37c4ac
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c  | 27 ++++++++-------
+ src/utils/sn_common.h  |  2 ++
+ tests/test_sub_notif.c | 75 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 93 insertions(+), 11 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index 27eaef03..73006174 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -640,6 +640,10 @@ wait:
+         goto wait;
+     }
+ 
++    /* a fired one-shot timer has no thread anymore, nobody joins it */
++    pthread_detach(pthread_self());
++    sntimer->tid = 0;
++
+ cleanup:
+     /* TIMER UNLOCK */
+     pthread_mutex_unlock(&sntimer->lock);
+@@ -681,20 +685,20 @@ srsn_update_timer(const struct timespec *trigger, const struct timespec *interva
+     /* TIMER LOCK */
+     pthread_mutex_lock(&sntimer->lock);
+ 
+-    /* timer must exist if it is not just a cleanup */
+-    assert(!trigger || sntimer->tid);
++    if (!sntimer->tid) {
++        /* the thread has ended, a one-shot timer may have just fired */
++        goto cleanup_unlock;
++    }
+ 
+     if (!trigger) {
+-        if (sntimer->tid) {
+-            /* stop the timer, thread will terminate on its own */
+-            if (pthread_self() == sntimer->tid) {
+-                /* use detach because this is the timer thread itself */
+-                pthread_detach(sntimer->tid);
+-            } else {
+-                tid = sntimer->tid;
+-            }
+-            sntimer->tid = 0;
++        /* stop the timer, thread will terminate on its own */
++        if (pthread_self() == sntimer->tid) {
++            /* use detach because this is the timer thread itself */
++            pthread_detach(sntimer->tid);
++        } else {
++            tid = sntimer->tid;
+         }
++        sntimer->tid = 0;
+     } else {
+         /* update trigger and/or interval */
+         sntimer->trigger = *trigger;
+@@ -709,6 +713,7 @@ srsn_update_timer(const struct timespec *trigger, const struct timespec *interva
+     /* COND SIGNAL */
+     pthread_cond_signal(&sntimer->cond);
+ 
++cleanup_unlock:
+     /* TIMER UNLOCK */
+     pthread_mutex_unlock(&sntimer->lock);
+ 
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index 84554e00..888fa520 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -257,6 +257,8 @@ sr_error_info_t *srsn_create_timer(void (*cb)(void *arg, int *freed), void *arg,
+ /**
+  * @brief Update or stop a timer.
+  *
++ * Has no effect on a fired one-shot or a stopped timer, srsn_create_timer() starts it again.
++ *
+  * @param[in] trigger New trigger of the timer, NULL to stop it instead.
+  * @param[in] interval New interval of the timer.
+  * @param[in] sntimer Timer to update.
+diff --git a/tests/test_sub_notif.c b/tests/test_sub_notif.c
+index 22b2c0e9..d8d70a57 100644
+--- a/tests/test_sub_notif.c
++++ b/tests/test_sub_notif.c
+@@ -715,6 +715,80 @@ test_yp_on_change(void **state)
+     close(fd);
+ }
+ 
++/**
++ * @brief Read a notification, asserting its name and, for a push-change-update, its patch ID.
++ *
++ * @param[in] st Test state.
++ * @param[in] fd Subscription FD.
++ * @param[in] timeout_ms Poll timeout.
++ * @param[in] name Expected notification name.
++ * @param[in] patch_id Expected patch ID, NULL to not check it.
++ */
++static void
++yp_expect_notif(struct state *st, int fd, uint32_t timeout_ms, const char *name, const char *patch_id)
++{
++    struct lyd_node *notif, *node;
++    struct timespec ts;
++
++    assert_int_equal(SR_ERR_OK, srsn_poll(fd, timeout_ms));
++    assert_int_equal(SR_ERR_OK, srsn_read_notif(fd, st->ly_ctx, &ts, &notif));
++    assert_string_equal(LYD_NAME(notif), name);
++    if (patch_id) {
++        assert_int_equal(LY_SUCCESS, lyd_find_path(notif, "datastore-changes/yang-patch/patch-id", 0, &node));
++        assert_string_equal(lyd_get_value(node), patch_id);
++    }
++    lyd_free_tree(notif);
++}
++
++/**
++ * @brief Set test-leaf and apply the change.
++ *
++ * @param[in] st Test state.
++ * @param[in] value Value to set.
++ */
++static void
++yp_set_test_leaf(struct state *st, const char *value)
++{
++    assert_int_equal(SR_ERR_OK, sr_set_item_str(st->sess, "/test:test-leaf", value, NULL, 0));
++    assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
++}
++
++/* TEST */
++static void
++test_yp_on_change_dampening(void **state)
++{
++    struct state *st = *state;
++    struct lyd_node *notif;
++    struct timespec ts1, ts2;
++    int fd;
++    uint32_t sub_id;
++
++    assert_int_equal(SR_ERR_OK, srsn_yang_push_on_change(st->sess, SR_DS_RUNNING, "/test:test-leaf", 500, 0, NULL,
++            NULL, 0, NULL, &fd, &sub_id));
++
++    /* the first change is sent at once, the second one when the dampening period ends */
++    yp_set_test_leaf(st, "1");
++    yp_set_test_leaf(st, "2");
++    assert_int_equal(SR_ERR_OK, srsn_poll(fd, 2000));
++    assert_int_equal(SR_ERR_OK, srsn_read_notif(fd, st->ly_ctx, &ts1, &notif));
++    lyd_free_tree(notif);
++    assert_int_equal(SR_ERR_OK, srsn_poll(fd, 2000));
++    assert_int_equal(SR_ERR_OK, srsn_read_notif(fd, st->ly_ctx, &ts2, &notif));
++    lyd_free_tree(notif);
++    assert_true(((int64_t)ts2.tv_sec - ts1.tv_sec) * 1000 + (ts2.tv_nsec - ts1.tv_nsec) / 1000000 >= 450);
++
++    /* a change after the next dampening period ended is sent at once again */
++    usleep(600000);
++    yp_set_test_leaf(st, "3");
++    yp_expect_notif(st, fd, 2000, "push-change-update", "patch-3");
++
++    /* cleanup */
++    assert_int_equal(SR_ERR_OK, srsn_terminate(sub_id, NULL));
++    close(fd);
++    assert_int_equal(SR_ERR_OK, sr_delete_item(st->sess, "/test:test-leaf", 0));
++    assert_int_equal(SR_ERR_OK, sr_apply_changes(st->sess, 0));
++}
++
+ /* TEST */
+ static int
+ setup_nacm(void **state)
+@@ -1036,6 +1110,7 @@ main(void)
+         cmocka_unit_test(test_suspend),
+         cmocka_unit_test(test_yp_periodic),
+         cmocka_unit_test(test_yp_on_change),
++        cmocka_unit_test(test_yp_on_change_dampening),
+         cmocka_unit_test(test_read_eof),
+         cmocka_unit_test_setup_teardown(test_nacm_sub, setup_nacm, teardown_nacm),
+         cmocka_unit_test_setup_teardown(test_nacm_yp_periodic, setup_nacm, teardown_nacm),

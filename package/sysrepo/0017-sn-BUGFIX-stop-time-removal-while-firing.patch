@@ -1,0 +1,85 @@
+From 2ae67180b50b7e498e28ff3fc91cd20501147b5e Mon Sep 17 00:00:00 2001
+From: Roman Janota <Roman.Janota@cesnet.cz>
+Date: Mon, 12 Oct 2026 10:11:32 +0200
+Subject: [PATCH] sn BUGFIX stop-time removal while firing
+
+srsn_modify_stop_time() removing the stop-time joined the stop timer
+thread under the subscription lock. A callback that had just fired
+waits for that lock, so both blocked forever.
+
+Removing the stop-time now disarms the timer instead, its thread waits
+without a deadline and is joined by the teardown as before. A removal
+racing with a timer that has already fired still terminates the
+subscription, its stop-time was reached.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/09ccd326b3248572b93f43d056ef4769f7d13d4c
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/utils/sn_common.c | 19 ++++++++++++++-----
+ src/utils/sn_common.h |  2 +-
+ 2 files changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/src/utils/sn_common.c b/src/utils/sn_common.c
+index 1591d287..f3542379 100644
+--- a/src/utils/sn_common.c
++++ b/src/utils/sn_common.c
+@@ -289,7 +289,7 @@ srsn_stop_timer_cb(void *arg, int *freed)
+      * touched afterwards */
+     *freed = 1;
+ 
+-    /* TIMER UNLOCK */
++    /* TIMER UNLOCK, before the lock below, srsn_modify_stop() takes them in the opposite order */
+     pthread_mutex_unlock(&sub->stop_sntimer.lock);
+ 
+     /* LOCK */
+@@ -654,8 +654,13 @@ wait:
+         /* wait until the trigger, allow its modification from another thread */
+         trigger = sntimer->trigger;
+ 
+-        /* TIMER COND WAIT */
+-        r = pthread_cond_clockwait(&sntimer->cond, &sntimer->lock, CLOCK_REALTIME, &trigger);
++        if (!trigger.tv_sec && !trigger.tv_nsec) {
++            /* disarmed, wait for a new trigger */
++            r = pthread_cond_wait(&sntimer->cond, &sntimer->lock);
++        } else {
++            /* TIMER COND WAIT */
++            r = pthread_cond_clockwait(&sntimer->cond, &sntimer->lock, CLOCK_REALTIME, &trigger);
++        }
+ 
+         if (!sntimer->tid) {
+             /* we should terminate */
+@@ -851,15 +856,19 @@ sr_error_info_t *
+ srsn_modify_stop(struct srsn_sub *sub, const struct timespec *stop_time)
+ {
+     sr_error_info_t *err_info = NULL;
++    const struct timespec disarmed = {0};
+ 
+     if ((!stop_time && sub->stop_time.tv_sec) || (stop_time && sr_time_cmp(&sub->stop_time, stop_time))) {
+-        if (!sub->stop_time.tv_sec) {
++        if (!stop_time) {
++            /* only disarm the stop timer, joining its thread under the srsn lock could deadlock */
++            srsn_update_timer(&disarmed, NULL, &sub->stop_sntimer);
++        } else if (!sub->stop_sntimer.tid) {
+             /* create the stop timer */
+             if ((err_info = srsn_create_timer(srsn_stop_timer_cb, sub, stop_time, NULL, &sub->stop_sntimer))) {
+                 goto cleanup;
+             }
+         } else {
+-            /* update/delete the stop timer */
++            /* update the stop timer */
+             srsn_update_timer(stop_time, NULL, &sub->stop_sntimer);
+         }
+ 
+diff --git a/src/utils/sn_common.h b/src/utils/sn_common.h
+index f69b033c..98a95fc1 100644
+--- a/src/utils/sn_common.h
++++ b/src/utils/sn_common.h
+@@ -287,7 +287,7 @@ sr_error_info_t *srsn_create_timer(void (*cb)(void *arg, int *freed), void *arg,
+  *
+  * Has no effect on a fired one-shot or a stopped timer, srsn_create_timer() starts it again.
+  *
+- * @param[in] trigger New trigger of the timer, NULL to stop it instead.
++ * @param[in] trigger New trigger of the timer, zero to disarm it, NULL to stop it instead.
+  * @param[in] interval New interval of the timer.
+  * @param[in] sntimer Timer to update.
+  */
