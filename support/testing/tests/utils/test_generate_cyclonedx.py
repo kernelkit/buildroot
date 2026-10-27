@@ -141,6 +141,82 @@ class TestGenerateCycloneDX(unittest.TestCase):
         foo_deps = next(d for d in result["dependencies"] if d["ref"] == "package-foo")
         self.assertEqual(foo_deps["dependsOn"], ["package-bar", "skeleton-baz"])
 
+    def test_vendored_dependencies(self):
+        info = self._make_show_info()
+        info["package-foo"]["vendored_dependencies"] = [
+            {
+                "name": "example.org/lib",
+                "version": "v1.0.0",
+                "purl": "pkg:golang/example.org/lib@v1.0.0",
+            },
+            {
+                "name": "example.org/fork",
+                "version": "v1.1.0",
+                "purl": "pkg:golang/example.org/fork@v1.1.0",
+                "replaces": {
+                    "name": "example.org/upstream",
+                    "version": "v1.0.0",
+                    "purl": "pkg:golang/example.org/upstream@v1.0.0",
+                },
+            },
+        ]
+        info["package-bar"]["vendored_dependencies"] = [
+            {
+                "name": "example.org/lib",
+                "version": "v1.0.0",
+                "purl": "pkg:golang/example.org/lib@v1.0.0",
+            },
+        ]
+
+        result = self._run_script(show_info=info)
+
+        foo = self._find_component(result, "package-foo")
+        self.assertEqual(
+            foo["components"],
+            [
+                {
+                    "bom-ref": "package-foo:pkg:golang/example.org/lib@v1.0.0",
+                    "type": "library",
+                    "name": "example.org/lib",
+                    "version": "v1.0.0",
+                    "purl": "pkg:golang/example.org/lib@v1.0.0",
+                },
+                {
+                    "bom-ref": "package-foo:pkg:golang/example.org/fork@v1.1.0",
+                    "type": "library",
+                    "name": "example.org/fork",
+                    "version": "v1.1.0",
+                    "purl": "pkg:golang/example.org/fork@v1.1.0",
+                    "pedigree": {
+                        "ancestors": [
+                            {
+                                "type": "library",
+                                "name": "example.org/upstream",
+                                "version": "v1.0.0",
+                                "purl": "pkg:golang/example.org/upstream@v1.0.0",
+                            },
+                        ],
+                    },
+                },
+            ],
+        )
+
+        bar = self._find_component(result, "package-bar")
+        self.assertEqual(bar["components"][0]["bom-ref"], "package-bar:pkg:golang/example.org/lib@v1.0.0")
+
+        foo_deps = next(d for d in result["dependencies"] if d["ref"] == "package-foo")
+        self.assertEqual(
+            foo_deps["dependsOn"],
+            [
+                "package-bar",
+                "package-foo:pkg:golang/example.org/fork@v1.1.0",
+                "package-foo:pkg:golang/example.org/lib@v1.0.0",
+                "skeleton-baz",
+            ],
+        )
+
+        self.assertNotIn("components", self._find_component(result, "skeleton-baz"))
+
     def test_external_references(self):
         info = self._make_show_info()
         info["package-foo"]["downloads"] = [
