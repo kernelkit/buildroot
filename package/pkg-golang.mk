@@ -91,6 +91,22 @@ $(2)_DL_ENV += \
 	GOPROXY=direct \
 	$$($(2)_GO_ENV)
 
+# Local and overridden sources skip the download step, so vendor their
+# modules here when the source tree does not carry a vendor/ directory.
+# The module cache lives in DL_DIR, go.sum verifies its contents. Run
+# from the source tree so relative replace directives resolve.
+define $(2)_GO_VENDOR_OVERRIDE
+	$$(Q)$$(if $$($(2)_OVERRIDE_SRCDIR), \
+		if [ -f $$($(2)_OVERRIDE_SRCDIR)/go.mod ] && \
+		   [ ! -d $$($(2)_OVERRIDE_SRCDIR)/vendor ]; then \
+			cd $$($(2)_OVERRIDE_SRCDIR) && $$($(2)_DL_ENV) \
+				GOFLAGS=-mod=mod \
+				GOMODCACHE=$$(DL_DIR)/go-mod \
+				$$(GO_BIN) mod vendor -modcacherw -o $$(@D)/vendor; \
+		fi)
+endef
+$(2)_PRE_BUILD_HOOKS += $(2)_GO_VENDOR_OVERRIDE
+
 # Because we append vendored info, we can't rely on the values being empty
 # once we eventually get into the generic-package infra. So, we duplicate
 # the heuristics here
