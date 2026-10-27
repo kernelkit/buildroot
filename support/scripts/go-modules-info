@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""List the Go modules linked into a set of Go binaries.
+
+Reads the build info that the Go toolchain embeds in every binary
+(go version -m -json) and writes the third-party modules, deduplicated
+across binaries, as a compact JSON list. Modules replaced by a local
+directory are part of the package source and are left out.
+
+Each entry has the name, version and purl of the module that was built.
+When a replace directive swapped in another module, the original is
+recorded under "replaces".
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import urllib.parse
+
+
+def purl(path, version):
+    segments = [urllib.parse.quote(s, safe="") for s in path.split("/")]
+    return f"pkg:golang/{'/'.join(segments)}@{urllib.parse.quote(version, safe='')}"
+
+
+def is_local(path):
+    return path.startswith(("./", "../", "/"))
+
+
+def module(path, version):
+    return {"name": path, "version": version, "purl": purl(path, version)}
+
+
+def binary_deps(go, binary):
+    out = subprocess.run([go, "version", "-m", "-json", binary],
+                         check=True, capture_output=True, text=True).stdout
+    return json.loads(out).get("Deps") or []
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--go", required=True, help="Path to the go tool")
+    parser.add_argument("-o", "--output", required=True, help="Output JSON file")
+    parser.add_argument("binaries", nargs="*", help="Go binaries to inspect")
+    args = parser.parse_args()
+
+    modules = {}
+    for binary in args.binaries:
+        for dep in binary_deps(args.go, binary):
+            repl = dep.get("Replace")
+            if repl:
+                if is_local(repl["Path"]):
+                    continue
+                entry = module(repl["Path"], repl["Version"])
+                entry["replaces"] = module(dep["Path"], dep["Version"])
+            else:
+                entry = module(dep["Path"], dep["Version"])
+            modules[entry["purl"]] = entry
+
+    with open(args.output, "w") as f:
+        json.dump([modules[k] for k in sorted(modules)], f, separators=(",", ":"))
+        f.write("\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

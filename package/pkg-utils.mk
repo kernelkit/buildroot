@@ -111,6 +111,10 @@ define json-info
 	}
 endef
 
+# File in a package build directory listing the dependencies vendored into
+# it, as a JSON list of {name, version, purl}, added to show-info when present
+PKG_VENDORED_DEPS_FILE = .br_vendored_dependencies.json
+
 # _json-info-pkg, _json-info-pkg-details, _json-info-fs: private helpers
 # for json-info, above
 define _json-info-pkg
@@ -210,6 +214,9 @@ define _json-info-pkg-details
 			$(call mk-json-str,$(patsubst $(CONFIG_DIR)/%,%,$(patch)))$(comma) \
 		)
 	],
+	$(if $(wildcard $($(1)_DIR)/$(PKG_VENDORED_DEPS_FILE)), \
+		"vendored_dependencies": $(shell cat $($(1)_DIR)/$(PKG_VENDORED_DEPS_FILE))$(comma) \
+	)
 	$(if $($(1)_PROVIDES), \
 		"provides": [ \
 			$(foreach provide, \

@@ -177,6 +177,14 @@ define $(2)_INSTALL_CMDS
 endef
 endif
 
+# Record the Go modules linked into the built binaries, for show-info
+define $(2)_GO_MODULES_INFO
+	$$(Q)$$(TOPDIR)/support/scripts/go-modules-info --go $$(GO_BIN) \
+		-o $$(@D)/$$(PKG_VENDORED_DEPS_FILE) \
+		$$$$(find $$(@D)/bin -maxdepth 1 -type f 2>/dev/null)
+endef
+$(2)_POST_BUILD_HOOKS += $(2)_GO_MODULES_INFO
+
 # Call the generic package infrastructure to generate the necessary make
 # targets
 $(call inner-generic-package,$(1),$(2),$(3),$(4))
