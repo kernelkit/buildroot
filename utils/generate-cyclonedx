@@ -405,10 +405,58 @@ def cyclonedx_component(name, comp):
         } if "cpe-id" in comp else {}),
         **cyclonedx_external_refs(comp),
         **(cyclonedx_patches(name, comp["patches"]) if comp.get("patches") else {}),
+        **(cyclonedx_vendored(name, comp["vendored_dependencies"]) if comp.get("vendored_dependencies") else {}),
         "properties": [{
             "name": "BR_TYPE",
             "value": comp["type"],
         }],
+    }
+
+
+def vendored_ref(name, dep):
+    """Return the bom-ref of a dependency vendored into a package.
+
+    Args:
+        name (str): Key used for the package in the show-info output.
+        dep (dict): Vendored dependency from the show-info output.
+
+    Returns:
+        str: bom-ref, unique even when several packages vendor the same dependency.
+    """
+    return f"{name}:{dep['purl']}"
+
+
+def cyclonedx_vendored(name, deps):
+    """Translate the vendored dependencies of a package to nested CycloneDX components.
+
+    A dependency swapped in for another one, e.g. a fork through a Go
+    replace directive, lists the original as its ancestor.
+
+    Args:
+        name (str): Key used for the package in the show-info output.
+        deps (list): Vendored dependencies from the show-info output.
+
+    Returns:
+        dict: Nested components in CycloneDX format.
+    """
+    def component(dep):
+        return {
+            "type": "library",
+            "name": dep["name"],
+            "version": dep["version"],
+            "purl": dep["purl"],
+        }
+
+    return {
+        "components": [{
+            "bom-ref": vendored_ref(name, dep),
+            **component(dep),
+            **({
+                "pedigree": {
+                    "ancestors": [component(dep["replaces"])],
+                },
+            } if "replaces" in dep else {}),
+        } for dep in deps],
     }
 
 
@@ -600,8 +648,9 @@ def main():
         ],
         "dependencies": [
             cyclonedx_dependency(args.project_name, br2_root_deps(filtered_show_info_dict, args.virtual)),
-            *[cyclonedx_dependency(ref, br2_parse_deps(ref, show_info_dict, args.virtual))
-              for ref in filtered_show_info_dict],
+            *[cyclonedx_dependency(ref, br2_parse_deps(ref, show_info_dict, args.virtual) +
+                                   [vendored_ref(ref, dep) for dep in comp.get("vendored_dependencies", [])])
+              for ref, comp in filtered_show_info_dict.items()],
         ],
         "vulnerabilities": cyclonedx_vulnerabilities(show_info_dict),
     }
