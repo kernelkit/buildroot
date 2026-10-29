@@ -1,0 +1,856 @@
+From 490fe0fa18b06427a1096d2c7ffb89f4bd5d335c Mon Sep 17 00:00:00 2001
+From: Michal Vasko <mvasko@cesnet.cz>
+Date: Thu, 29 Oct 2026 13:53:07 +0100
+Subject: [PATCH] nacm BUGFIX apply filters after applying NACM
+
+As per NACM spec to avoid leaking inaccessible
+information.
+
+Upstream: https://github.com/sysrepo/sysrepo/commit/d943e72f107f83601b64d5aa3186ec9d65a23d24
+Signed-off-by: Mattias Walström <lazzer@gmail.com>
+---
+ src/common.c                  |  35 ------
+ src/common.h                  |  16 +--
+ src/modinfo.c                 |  57 +++++++---
+ src/modinfo.h                 |   8 +-
+ src/sysrepo.c                 | 197 +++-------------------------------
+ src/utils/nacm.c              | 161 +++++++++++++++++----------
+ src/utils/nacm.h              |  17 +--
+ src/utils/private_candidate.c |   6 +-
+ tests/test_nacm.c             |  33 +-----
+ 9 files changed, 186 insertions(+), 344 deletions(-)
+
+diff --git a/src/common.c b/src/common.c
+index 0a96a8f4..f59c5621 100644
+--- a/src/common.c
++++ b/src/common.c
+@@ -4656,41 +4656,6 @@ sr_val_sr2ly(struct ly_ctx *ctx, const char *xpath, const char *val_str, int dfl
+     return NULL;
+ }
+ 
+-sr_error_info_t *
+-sr_lyd_dup_r(const struct lyd_node *src_parent, uint32_t depth, uint32_t options, struct lyd_node *trg_parent)
+-{
+-    sr_error_info_t *err_info = NULL;
+-    const struct lyd_node *src_child;
+-    struct lyd_node *trg_child;
+-
+-    /* fix invalid options */
+-    options &= ~(LYD_DUP_RECURSIVE | LYD_DUP_WITH_PARENTS);
+-
+-    if (!depth || (src_parent->schema->nodetype & (LYS_LEAF | LYS_LEAFLIST | LYS_ANYDATA))) {
+-        return NULL;
+-    }
+-
+-    /* skip keys, they are already duplicated */
+-    src_child = lyd_child_no_keys(src_parent);
+-    while (src_child) {
+-        if ((err_info = sr_lyd_dup(src_child, NULL, options, 0, &trg_child))) {
+-            return err_info;
+-        }
+-
+-        if ((err_info = sr_lyd_insert_child(trg_parent, trg_child))) {
+-            SR_ERRINFO_INT(&err_info);
+-            return err_info;
+-        }
+-        if ((err_info = sr_lyd_dup_r(src_child, depth - 1, options, trg_child))) {
+-            return err_info;
+-        }
+-
+-        src_child = src_child->next;
+-    }
+-
+-    return NULL;
+-}
+-
+ void
+ sr_lyd_trim_depth(struct lyd_node *subtree, uint32_t max_depth)
+ {
+diff --git a/src/common.h b/src/common.h
+index ca33bf8c..c3854249 100644
+--- a/src/common.h
++++ b/src/common.h
+@@ -1340,18 +1340,6 @@ sr_error_info_t *sr_val_sr2ly_str(struct ly_ctx *ctx, const sr_val_t *sr_val, co
+ sr_error_info_t *sr_val_sr2ly(struct ly_ctx *ctx, const char *xpath, const char *val_str, int dflt, int output,
+         struct lyd_node **root);
+ 
+-/**
+- * @brief Duplicate nodes recursively to the specified depth.
+- *
+- * @param[in] src_parent Source parent.
+- * @param[in] depth Depth to duplicate.
+- * @param[in] options libyang dup options.
+- * @param[in,out] trg_parent Target parent to add children to.
+- * @return err_info, NULL on success.
+- */
+-sr_error_info_t *sr_lyd_dup_r(const struct lyd_node *src_parent, uint32_t depth, uint32_t options,
+-        struct lyd_node *trg_parent);
+-
+ /**
+  * @brief Trim subtree to the specified depth.
+  *
+@@ -1668,15 +1656,13 @@ sr_error_info_t *_sr_acquire_data(sr_conn_ctx_t *conn, struct lyd_node *tree, sr
+ /**
+  * @brief Remove all the non-selected subtrees.
+  *
+- * @param[in] session Session to use.
+  * @param[in,out] first First top-level node of the tree to prune, may be adjusted.
+  * @param[in] set Set with the selected (disjoint) subtrees.
+  * @param[in] max_depth Max depth of the selected nodes to prune.
+  * @param[in] opts Get options.
+- * @param[out] tree Resulting data tree.
+  * @return err_info, NULL on success.
+  */
+-sr_error_info_t *sr_get_data_prune(sr_session_ctx_t *session, struct lyd_node **first, const struct ly_set *set, uint32_t max_depth,
++sr_error_info_t *sr_get_data_prune(struct lyd_node **first, const struct ly_set *set, uint32_t max_depth,
+         const uint32_t opts);
+ 
+ /**
+diff --git a/src/modinfo.c b/src/modinfo.c
+index ea2c0064..69a1f8aa 100644
+--- a/src/modinfo.c
++++ b/src/modinfo.c
+@@ -3404,16 +3404,52 @@ cleanup:
+ }
+ 
+ sr_error_info_t *
+-sr_modinfo_get_filter(struct sr_mod_info_s *mod_info, const char *xpath, sr_session_ctx_t *session,
+-        int ignore_new_changes, struct ly_set **result)
++sr_modinfo_get_filter(struct sr_mod_info_s *mod_info, const char *xpath, const uint32_t opts, sr_session_ctx_t *session,
++        struct ly_set **result)
+ {
+     sr_error_info_t *err_info = NULL, *val_err_info = NULL;
+     struct sr_mod_info_mod_s *mod;
+-    struct lyd_node *edit = NULL, *diff = NULL;
+-    uint32_t i;
+-    int is_oper_ds = (session->ds == SR_DS_OPERATIONAL) ? 1 : 0;
++    struct lyd_node *edit = NULL, *diff = NULL, *root, *next, *root_dup;
++    uint32_t i, dup_opts;
++    int denied, is_oper_ds = (session->ds == SR_DS_OPERATIONAL) ? 1 : 0;
++
++    /* apply NACM before filtering (according to RFC 8341 section 3.2.4.) */
++    if (mod_info->data_cached) {
++        dup_opts = LYD_DUP_WITH_FLAGS | ((opts & SR_OPER_WITH_ORIGIN) ? 0 : LYD_DUP_NO_META);
++
++        LY_LIST_FOR_SAFE(mod_info->data, next, root) {
++            if ((err_info = sr_nacm_dup_subtree_read_filter(session, root, dup_opts, &root_dup))) {
++                goto cleanup;
++            }
+ 
+-    if (!ignore_new_changes && (session->ds < SR_DS_COUNT)) {
++            /* append */
++            if (mod_info->data_cached) {
++                mod_info->data = root_dup;
++                mod_info->data_cached = 0;
++
++                /* CACHE READ UNLOCK */
++                sr_rwunlock(&sr_run_cache.lock, SR_RUN_CACHE_LOCK_TIMEOUT, SR_LOCK_READ, mod_info->conn->cid, __func__);
++            } else {
++                if ((err_info = sr_lyd_insert_sibling(mod_info->data, root_dup, &mod_info->data))) {
++                    lyd_free_tree(root_dup);
++                    goto cleanup;
++                }
++            }
++        }
++    } else {
++        LY_LIST_FOR_SAFE(mod_info->data, next, root) {
++            if ((err_info = sr_nacm_get_subtree_read_filter(session, root, &denied))) {
++                goto cleanup;
++            }
++
++            if (denied) {
++                /* the whole subtree was filtered out */
++                sr_lyd_free_tree_safe(root, &mod_info->data);
++            }
++        }
++    }
++
++    if (!(opts & SR_OPER_NO_NEW_CHANGES) && (session->ds < SR_DS_COUNT)) {
+         /* collect edit/diff to be applied based on the handled event */
+         switch (session->ev) {
+         case SR_SUB_EV_CHANGE:
+@@ -3443,15 +3479,6 @@ sr_modinfo_get_filter(struct sr_mod_info_s *mod_info, const char *xpath, sr_sess
+     }
+ 
+     if (diff || edit) {
+-        if (mod_info->data_cached) {
+-            /* data will be changed, we cannot use the cache anymore */
+-            lyd_dup_siblings(mod_info->data, NULL, LYD_DUP_RECURSIVE | LYD_DUP_WITH_FLAGS, &mod_info->data);
+-            mod_info->data_cached = 0;
+-
+-            /* CACHE READ UNLOCK */
+-            sr_rwunlock(&sr_run_cache.lock,  SR_RUN_CACHE_LOCK_TIMEOUT, SR_LOCK_READ, mod_info->conn->cid, __func__);
+-        }
+-
+         for (i = 0; (i < mod_info->mod_count) && (session->ds < SR_DS_COUNT); ++i) {
+             mod = &mod_info->mods[i];
+             if (mod->state & MOD_INFO_REQ) {
+diff --git a/src/modinfo.h b/src/modinfo.h
+index 82a5f87b..83a6b1c7 100644
+--- a/src/modinfo.h
++++ b/src/modinfo.h
+@@ -354,17 +354,17 @@ sr_error_info_t *sr_modinfo_op_validate(struct sr_mod_info_s *mod_info, struct l
+ sr_error_info_t *sr_modinfo_change_diff_merge_pred_data(struct sr_mod_info_s *mod_info);
+ 
+ /**
+- * @brief Filter data from mod info.
++ * @brief Apply read NACM check and filter data from mod info.
+  *
+  * @param[in] mod_info Mod info to use.
+  * @param[in] xpath Selected data.
++ * @param[in] opts Get options.
+  * @param[in] session Sysrepo session.
+- * @param[in] ignore_new_changes If set, do not use prepared edit changes or stored diff.
+  * @param[out] result Resulting set of matching nodes.
+  * @return err_info, NULL on success.
+  */
+-sr_error_info_t *sr_modinfo_get_filter(struct sr_mod_info_s *mod_info, const char *xpath, sr_session_ctx_t *session,
+-        int ignore_new_changes, struct ly_set **result);
++sr_error_info_t *sr_modinfo_get_filter(struct sr_mod_info_s *mod_info, const char *xpath, const uint32_t opts,
++        sr_session_ctx_t *session, struct ly_set **result);
+ 
+ /**
+  * @brief Publish "update" event for diff in mod info and update it is needed.
+diff --git a/src/sysrepo.c b/src/sysrepo.c
+index 9a858a55..49f52d29 100644
+--- a/src/sysrepo.c
++++ b/src/sysrepo.c
+@@ -3108,13 +3108,8 @@ sr_get_item(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms, sr
+         goto cleanup;
+     }
+ 
+-    /* filter the required data */
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, path, session, 0, &set))) {
+-        goto cleanup;
+-    }
+-
+-    /* apply NACM */
+-    if ((err_info = sr_nacm_get_node_set_read_filter(session, set))) {
++    /* apply NACM and filter the required data */
++    if ((err_info = sr_modinfo_get_filter(&mod_info, path, 0, session, &set))) {
+         goto cleanup;
+     }
+ 
+@@ -3216,9 +3211,8 @@ sr_get_items(sr_session_ctx_t *session, const char *xpath, uint32_t timeout_ms,
+         goto cleanup;
+     }
+ 
+-    /* filter the required data */
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, session,
+-            opts & SR_OPER_NO_NEW_CHANGES, &set))) {
++    /* apply NACM and filter the required data */
++    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, opts, session, &set))) {
+         goto cleanup;
+     }
+ 
+@@ -3239,11 +3233,6 @@ sr_get_items(sr_session_ctx_t *session, const char *xpath, uint32_t timeout_ms,
+         }
+     }
+ 
+-    /* apply NACM */
+-    if ((err_info = sr_nacm_get_node_set_read_filter(session, set))) {
+-        goto cleanup;
+-    }
+-
+     if (set->count) {
+         *values = calloc(set->count, sizeof **values);
+         SR_CHECK_MEM_GOTO(!*values, err_info, cleanup);
+@@ -3353,7 +3342,6 @@ sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms,
+     struct ly_set *set = NULL;
+     struct sr_mod_info_s mod_info;
+     struct lyd_node *oper_data_crashed = NULL;
+-    int denied;
+ 
+     SR_CHECK_ARG_APIRET(!session || !path || !subtree, session, err_info);
+ 
+@@ -3387,12 +3375,7 @@ sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms,
+     }
+ 
+     /* filter the required data */
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, path, session, 0, &set))) {
+-        goto cleanup;
+-    }
+-
+-    /* apply NACM #1, get rid of whole denied results */
+-    if ((err_info = sr_nacm_get_node_set_read_filter(session, set))) {
++    if ((err_info = sr_modinfo_get_filter(&mod_info, path, 0, session, &set))) {
+         goto cleanup;
+     }
+ 
+@@ -3414,12 +3397,6 @@ sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms,
+         goto cleanup;
+     }
+ 
+-    /* apply NACM #2, filter out the selected subtree */
+-    if ((err_info = sr_nacm_get_subtree_read_filter(session, (*subtree)->tree, &denied))) {
+-        goto cleanup;
+-    }
+-    assert(!denied);
+-
+ cleanup:
+     /* MODULES UNLOCK */
+     sr_shmmod_modinfo_unlock(&mod_info);
+@@ -3437,122 +3414,6 @@ cleanup:
+     return sr_api_ret(session, err_info);
+ }
+ 
+-/**
+- * @brief Get-data parent hash table record.
+- */
+-struct sr_lyht_get_data_rec {
+-    struct lyd_node *input_parent;  /**< parent in the input (sysrepo) data */
+-    struct lyd_node *result_parent; /**< parent in the result (user returned) data */
+-};
+-
+-/**
+- * @brief Get-data dup parent hash table equal callback.
+- */
+-static ly_bool
+-sr_lyht_get_data_dup_equal_cb(void *val1_p, void *val2_p, ly_bool UNUSED(mod), void *UNUSED(cb_data))
+-{
+-    struct sr_lyht_get_data_rec *val1, *val2;
+-
+-    val1 = val1_p;
+-    val2 = val2_p;
+-
+-    return val1->input_parent == val2->input_parent;
+-}
+-
+-/**
+- * @brief Duplicate a set of subtrees into a new data tree.
+- *
+- * @param[in] session Session to use.
+- * @param[in] set Set with the selected (disjoint) subtrees.
+- * @param[in] max_depth Max depth of the nodes to duplicate.
+- * @param[in] opts Get options.
+- * @param[out] tree Resulting data tree.
+- * @return err_info, NULL on success.
+- */
+-static sr_error_info_t *
+-sr_get_data_dup(sr_session_ctx_t *session, const struct ly_set *set, uint32_t max_depth, const uint32_t opts,
+-        struct lyd_node **tree)
+-{
+-    sr_error_info_t *err_info = NULL;
+-    uint32_t i, hash;
+-    int dup_opts, denied;
+-    struct ly_ht *ht = NULL;
+-    struct sr_lyht_get_data_rec rec, *rec_p;
+-    struct lyd_node *node, *parent, *node_parent, *input_node;
+-
+-    /* create a hash table for finding existing parents */
+-    ht = lyht_new(1, sizeof rec, sr_lyht_get_data_dup_equal_cb, NULL, 1);
+-    SR_CHECK_MEM_GOTO(!ht, err_info, cleanup);
+-
+-    /* prepare duplication options */
+-    dup_opts = (max_depth ? 0 : LYD_DUP_RECURSIVE) | LYD_DUP_WITH_PARENTS | LYD_DUP_WITH_FLAGS |
+-            ((opts & SR_OPER_WITH_ORIGIN) ? 0 : LYD_DUP_NO_META);
+-
+-    for (i = 0; i < set->count; ++i) {
+-        /* check whether a parent does not exist yet in the result */
+-        for (parent = lyd_parent(set->dnodes[i]); parent; parent = lyd_parent(parent)) {
+-            hash = lyht_hash((void *)&parent, sizeof parent);
+-            rec.input_parent = parent;
+-            if (!lyht_find(ht, &rec, hash, (void **)&rec_p)) {
+-                /* parent exists, use the one in the result */
+-                parent = rec_p->result_parent;
+-                break;
+-            }
+-        }
+-
+-        /* duplicate subtree and connect it to an existing parent, if any */
+-        if ((err_info = sr_lyd_dup(set->dnodes[i], parent, dup_opts, 0, &node))) {
+-            goto cleanup;
+-        }
+-
+-        /* get first created node parent (can be node itself) */
+-        for (node_parent = node; lyd_parent(node_parent) != parent; node_parent = lyd_parent(node_parent)) {}
+-
+-        /* duplicate only to the specified depth (the selected node was already duplicated, hence -1) */
+-        if (max_depth && (err_info = sr_lyd_dup_r(set->dnodes[i], max_depth - 1, dup_opts, node))) {
+-            lyd_free_tree(node_parent);
+-            goto cleanup;
+-        }
+-
+-        /* apply NACM on the selected subtree */
+-        if ((err_info = sr_nacm_get_subtree_read_filter(session, node, &denied))) {
+-            goto cleanup;
+-        }
+-        if (denied) {
+-            /* the whole subtree was filtered out, remove it with any new parents */
+-            lyd_free_tree(node_parent);
+-            continue;
+-        }
+-
+-        if (!parent) {
+-            /* connect to the result */
+-            if ((err_info = sr_lyd_insert_sibling(*tree, node_parent, tree))) {
+-                lyd_free_tree(node);
+-                goto cleanup;
+-            }
+-        }
+-
+-        /* store all the new potential parents in the result */
+-        input_node = lyd_parent(set->dnodes[i]);
+-        for (node = lyd_parent(node); node != parent; node = lyd_parent(node)) {
+-            hash = lyht_hash((void *)&input_node, sizeof input_node);
+-            rec.input_parent = input_node;
+-            rec.result_parent = node;
+-            assert(rec.input_parent->schema == rec.result_parent->schema);
+-            if ((err_info = sr_lyht_insert(ht, &rec, hash))) {
+-                goto cleanup;
+-            }
+-
+-            /* move input */
+-            input_node = lyd_parent(input_node);
+-        }
+-    }
+-
+-cleanup:
+-    lyht_free(ht, NULL);
+-    return err_info;
+-}
+-
+ /**
+  * @brief Get-data prune hash table equal callback.
+  */
+@@ -3614,12 +3475,10 @@ sr_get_data_prune_origin(struct lyd_node *node, const struct lys_module *or_mod)
+ }
+ 
+ sr_error_info_t *
+-sr_get_data_prune(sr_session_ctx_t *session, struct lyd_node **first, const struct ly_set *set, uint32_t max_depth,
+-        const uint32_t opts)
++sr_get_data_prune(struct lyd_node **first, const struct ly_set *set, uint32_t max_depth, const uint32_t opts)
+ {
+     sr_error_info_t *err_info = NULL;
+     uint32_t i;
+-    int denied;
+     struct ly_ht *parent_ht = NULL, *set_ht = NULL;
+     struct lyd_node *parent, *root, *node, *iter, *to_free;
+     const struct lys_module *or_mod;
+@@ -3645,15 +3504,6 @@ sr_get_data_prune(sr_session_ctx_t *session, struct lyd_node **first, const stru
+         /* trim the depth of the subtree */
+         sr_lyd_trim_depth(node, max_depth);
+ 
+-        /* apply NACM on the selected subtree */
+-        if ((err_info = sr_nacm_get_subtree_read_filter(session, node, &denied))) {
+-            goto cleanup;
+-        }
+-        if (denied) {
+-            /* the whole subtree was filtered out */
+-            continue;
+-        }
+-
+         /* store the result in HT, cannot be there yet */
+         lyrc = lyht_insert_no_check(set_ht, &node, (uintptr_t)node, NULL);
+         SR_CHECK_MEM_GOTO(lyrc == LY_EMEM, err_info, cleanup);
+@@ -3815,9 +3665,8 @@ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, ui
+         goto cleanup;
+     }
+ 
+-    /* filter the required data */
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, session,
+-            opts & SR_OPER_NO_NEW_CHANGES, &set))) {
++    /* apply NACM and filter the required data */
++    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, opts, session, &set))) {
+         goto cleanup;
+     }
+ 
+@@ -3831,22 +3680,15 @@ sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, ui
+         sr_oper_data_trim(set, opts, &mod_info.data);
+     }
+ 
+-    if (mod_info.data_cached) {
+-        /* duplicate all the selected data */
+-        if ((err_info = sr_get_data_dup(session, set, max_depth, opts, &(*data)->tree))) {
+-            goto cleanup;
+-        }
+-    } else {
+-        /* prune all the non-selected data */
+-        if ((err_info = sr_get_data_prune(session, &mod_info.data, set, max_depth, opts))) {
+-            goto cleanup;
+-        }
+-
+-        /* use the pruned data */
+-        (*data)->tree = mod_info.data;
+-        mod_info.data = NULL;
++    /* prune all the non-selected data */
++    if ((err_info = sr_get_data_prune(&mod_info.data, set, max_depth, opts))) {
++        goto cleanup;
+     }
+ 
++    /* use the pruned data */
++    (*data)->tree = mod_info.data;
++    mod_info.data = NULL;
++
+     if (opts & SR_GET_WITH_LAST_MODIF) {
+         /* add last-modif metadata */
+         if ((err_info = sr_get_data_add_last_modif((*data)->tree, &mod_info))) {
+@@ -3910,13 +3752,8 @@ sr_get_node(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms, sr
+         goto cleanup;
+     }
+ 
+-    /* filter the required data */
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, path, session, 0, &set))) {
+-        goto cleanup;
+-    }
+-
+-    /* apply NACM */
+-    if ((err_info = sr_nacm_get_node_set_read_filter(session, set))) {
++    /* apply NACM and filter the required data */
++    if ((err_info = sr_modinfo_get_filter(&mod_info, path, 0, session, &set))) {
+         goto cleanup;
+     }
+ 
+diff --git a/src/utils/nacm.c b/src/utils/nacm.c
+index 5f44fbfa..b693a18e 100644
+--- a/src/utils/nacm.c
++++ b/src/utils/nacm.c
+@@ -1894,7 +1894,9 @@ cleanup:
+ }
+ 
+ /**
+- * @brief Filter out any nodes in a subtree for which the user does not have R access, recursively.
++ * @brief Collect any subtrees in a subtree for which the user does not have R access, recursively.
++ *
++ * Does not check the parent nodes.
+  *
+  * @param[in] subtree Subtree to filter.
+  * @param[in] user User for the NACM filtering.
+@@ -1964,7 +1966,9 @@ sr_nacm_check_data_read_filter_r(const struct lyd_node *subtree, const char *use
+ }
+ 
+ /**
+- * @brief Collect any subtrees in a selected subtree for which the user does not have R access, recursively.
++ * @brief Collect any subtrees in a selected (nested) subtree for which the user does not have R access, recursively.
++ *
++ * Checks also the parent nodes.
+  *
+  * @param[in] subtree Subtree to filter.
+  * @param[in] user User for the NACM filtering.
+@@ -2069,17 +2073,18 @@ cleanup:
+ }
+ 
+ sr_error_info_t *
+-sr_nacm_get_node_set_read_filter(sr_session_ctx_t *session, struct ly_set *set)
++sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subtree, int *denied)
+ {
+     sr_error_info_t *err_info = NULL;
+     char **groups = NULL;
+-    uint32_t group_count = 0;
++    uint32_t group_count = 0, i;
+     struct ly_set denied_set = {0};
+     struct lyd_node *node;
+-    uint32_t i, j;
+-    int denied, r;
++    int r;
+ 
+-    if (!session->nacm_user) {
++    *denied = 0;
++
++    if (!session->nacm_user || !subtree) {
+         /* nothing to do */
+         return NULL;
+     }
+@@ -2088,65 +2093,120 @@ sr_nacm_get_node_set_read_filter(sr_session_ctx_t *session, struct ly_set *set)
+     r = pthread_mutex_lock(&nacm.lock);
+     if (r) {
+         sr_errinfo_new(&err_info, SR_ERR_INTERNAL, "Locking a mutex failed (%s: %s).", __func__, strerror(r));
+-        return err_info;
++        goto cleanup;
+     }
+ 
+-    if ((err_info = sr_nacm_collect_groups(session->nacm_user, &groups, &group_count))) {
+-        goto cleanup;
++    /* collect groups */
++    err_info = sr_nacm_collect_groups(session->nacm_user, &groups, &group_count);
++
++    if (!err_info) {
++        /* apply NACM on the subtree */
++        err_info = sr_nacm_check_data_read_filter(subtree, session->nacm_user, groups, group_count, &denied_set);
+     }
+ 
+-    i = 0;
+-    while (i < set->count) {
+-        if ((err_info = sr_nacm_check_data_read_filter(set->dnodes[i], session->nacm_user, groups, group_count,
+-                &denied_set))) {
+-            goto cleanup;
+-        }
++    /* NACM UNLOCK */
++    pthread_mutex_unlock(&nacm.lock);
+ 
+-        denied = 0;
+-        for (j = 0; j < denied_set.count; ++j) {
+-            /* any parent could have been denied instead of the node */
+-            for (node = set->dnodes[i]; node; node = lyd_parent(node)) {
+-                if (denied_set.dnodes[j] == node) {
+-                    denied = 1;
+-                    break;
+-                }
++    sr_nacm_free_groups(groups, group_count);
++    if (err_info) {
++        goto cleanup;
++    }
++
++    for (i = 0; i < denied_set.count; ++i) {
++        /* any parent could have been denied instead of the subtree */
++        for (node = subtree; node; node = lyd_parent(node)) {
++            if (denied_set.dnodes[i] == node) {
++                /* whole subtree filtered out */
++                *denied = 1;
++                goto cleanup;
+             }
+         }
+-        ly_set_erase(&denied_set, NULL);
+ 
+-        if (denied) {
+-            /* result denied */
+-            ly_set_rm_index_ordered(set, i, NULL);
+-            continue;
++        lyd_free_tree(denied_set.dnodes[i]);
++    }
++
++cleanup:
++    ly_set_erase(&denied_set, NULL);
++    return err_info;
++}
++
++/**
++ * @brief Duplicate nodes that were not denied R access, recursively.
++ *
++ * @param[in] subtree Subtree to duplicate.
++ * @param[in] dup_opts Duplicate options to use.
++ * @param[in] denied Set with denied subtrees.
++ * @param[in,out] denied_i Current index in @p denied.
++ * @param[in,out] dup_first First duplicated top-level node.
++ * @param[in,out] dup_parent Duplicated parent of @p subtree to insert into.
++ * @return err_info, NULL on success.
++ */
++static sr_error_info_t *
++sr_nacm_dup_subtree_read_filter_r(const struct lyd_node *subtree, uint32_t dup_opts, const struct ly_set *denied,
++        uint32_t *denied_i, struct lyd_node **dup_first, struct lyd_node *dup_parent)
++{
++    sr_error_info_t *err_info = NULL;
++    struct lyd_node *dup = NULL, *child;
++
++    /* check whether the whole subtree was not denied */
++    if ((*denied_i < denied->count) && (denied->dnodes[*denied_i] == subtree)) {
++        /* denied node found, stop recursive duplication */
++        ++(*denied_i);
++        goto cleanup;
++    }
++
++    /* duplicate the node */
++    if ((err_info = sr_lyd_dup(subtree, NULL, dup_opts, 0, &dup))) {
++        goto cleanup;
++    }
++
++    /* insert into the dup tree */
++    if (dup_parent) {
++        if ((err_info = sr_lyd_insert_child(dup_parent, dup))) {
++            lyd_free_tree(dup);
++            goto cleanup;
+         }
++    } else {
++        if ((err_info = sr_lyd_insert_sibling(*dup_first, dup, dup_first))) {
++            lyd_free_tree(dup);
++            goto cleanup;
++        }
++    }
+ 
+-        ++i;
++    /* recursive duplication */
++    LY_LIST_FOR(lyd_child_no_keys(subtree), child) {
++        if ((err_info = sr_nacm_dup_subtree_read_filter_r(child, dup_opts, denied, denied_i, dup_first, dup))) {
++            goto cleanup;
++        }
+     }
+ 
+ cleanup:
+-    /* NACM UNLOCK */
+-    pthread_mutex_unlock(&nacm.lock);
+-
+-    sr_nacm_free_groups(groups, group_count);
+-    ly_set_erase(&denied_set, NULL);
+     return err_info;
+ }
+ 
+ sr_error_info_t *
+-sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subtree, int *denied)
++sr_nacm_dup_subtree_read_filter(sr_session_ctx_t *session, const struct lyd_node *tree, uint32_t dup_opts,
++        struct lyd_node **dup)
+ {
+     sr_error_info_t *err_info = NULL;
+     char **groups = NULL;
+-    uint32_t group_count = 0, i;
++    uint32_t group_count = 0, i = 0;
++    enum sr_nacm_access access;
+     struct ly_set denied_set = {0};
+-    struct lyd_node *node;
+     int r;
+ 
+-    *denied = 0;
++    assert(!tree || !tree->parent);
++    assert(!(dup_opts & LYD_DUP_RECURSIVE));
+ 
+-    if (!session->nacm_user || !subtree) {
++    *dup = NULL;
++
++    if (!tree) {
+         /* nothing to do */
+-        return NULL;
++        goto cleanup;
++    } else if (!session->nacm_user) {
++        /* duplicate the whole tree */
++        err_info = sr_lyd_dup(tree, NULL, dup_opts | LYD_DUP_RECURSIVE, 0, dup);
++        goto cleanup;
+     }
+ 
+     /* NACM LOCK */
+@@ -2160,8 +2220,8 @@ sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subt
+     err_info = sr_nacm_collect_groups(session->nacm_user, &groups, &group_count);
+ 
+     if (!err_info) {
+-        /* apply NACM on the subtree */
+-        err_info = sr_nacm_check_data_read_filter(subtree, session->nacm_user, groups, group_count, &denied_set);
++        /* apply NACM on the tree */
++        err_info = sr_nacm_check_data_read_filter_r(tree, session->nacm_user, groups, group_count, &access, &denied_set);
+     }
+ 
+     /* NACM UNLOCK */
+@@ -2172,18 +2232,11 @@ sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subt
+         goto cleanup;
+     }
+ 
+-    for (i = 0; i < denied_set.count; ++i) {
+-        /* any parent could have been denied instead of the subtree */
+-        for (node = subtree; node; node = lyd_parent(node)) {
+-            if (denied_set.dnodes[i] == node) {
+-                /* whole subtree filtered out */
+-                *denied = 1;
+-                goto cleanup;
+-            }
+-        }
+-
+-        lyd_free_tree(denied_set.dnodes[i]);
++    /* duplicate all the nodes that were not denied R access */
++    if ((err_info = sr_nacm_dup_subtree_read_filter_r(tree, dup_opts, &denied_set, &i, dup, NULL))) {
++        goto cleanup;
+     }
++    assert(i == denied_set.count);
+ 
+ cleanup:
+     ly_set_erase(&denied_set, NULL);
+diff --git a/src/utils/nacm.h b/src/utils/nacm.h
+index 1698e0ad..47c904f6 100644
+--- a/src/utils/nacm.h
++++ b/src/utils/nacm.h
+@@ -148,23 +148,26 @@ struct sr_denied {
+ sr_error_info_t *sr_nacm_check_op(const char *nacm_user, const struct lyd_node *data, struct sr_denied *denied);
+ 
+ /**
+- * @brief Filter out result nodes that do not have R access to.
++ * @brief Filter out result tree subtrees that do not have R access to.
+  *
+  * @param[in] session Session to use.
+- * @param[in,out] set Set of nodes to filter.
++ * @param[in] subtree Subtree to filter.
++ * @param[out] denied Set if the whole @p subtree should be filtered out.
+  * @return err_info, NULL on success.
+  */
+-sr_error_info_t *sr_nacm_get_node_set_read_filter(sr_session_ctx_t *session, struct ly_set *set);
++sr_error_info_t *sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subtree, int *denied);
+ 
+ /**
+- * @brief Filter out result tree subtrees that do not have R access to.
++ * @brief Duplicate all nodes in a tree that have R access.
+  *
+  * @param[in] session Session to use.
+- * @param[in] subtree Subtree to filter.
+- * @param[out] denied Set if the whole @p subtree should be filtered out.
++ * @param[in] tree Tree to duplicate.
++ * @param[in] dup_opts Duplicate options to use.
++ * @param[out] dup Duplicated @p tree.
+  * @return err_info, NULL on success.
+  */
+-sr_error_info_t *sr_nacm_get_subtree_read_filter(sr_session_ctx_t *session, struct lyd_node *subtree, int *denied);
++sr_error_info_t *sr_nacm_dup_subtree_read_filter(sr_session_ctx_t *session, const struct lyd_node *tree, uint32_t dup_opts,
++        struct lyd_node **dup);
+ 
+ /**
+  * @brief Check whether a diff (simplified edit-config tree) can be applied by a user.
+diff --git a/src/utils/private_candidate.c b/src/utils/private_candidate.c
+index e552f558..66791820 100644
+--- a/src/utils/private_candidate.c
++++ b/src/utils/private_candidate.c
+@@ -1318,8 +1318,8 @@ sr_pc_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth,
+         goto cleanup;
+     }
+ 
+-    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, session,
+-            opts & SR_OPER_NO_NEW_CHANGES, &set))) {
++    if ((err_info = sr_modinfo_get_filter(&mod_info, (opts & SR_GET_NO_FILTER) ? "/*" : xpath, opts, session,
++            &set))) {
+         goto cleanup;
+     }
+ 
+@@ -1327,7 +1327,7 @@ sr_pc_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth,
+         goto cleanup;
+     }
+ 
+-    if ((err_info = sr_get_data_prune(session, &mod_info.data, set, max_depth, opts))) {
++    if ((err_info = sr_get_data_prune(&mod_info.data, set, max_depth, opts))) {
+         goto cleanup;
+     }
+ 
+diff --git a/tests/test_nacm.c b/tests/test_nacm.c
+index 922f3cab..b5b1a817 100644
+--- a/tests/test_nacm.c
++++ b/tests/test_nacm.c
+@@ -417,45 +417,16 @@ test_filter_denied(void **state)
+ {
+     struct state *st = (struct state *)*state;
+     sr_data_t *data;
+-    char *str;
+     int ret;
+ 
+     /* read data #1 filtering based on denied leaf */
+     ret = sr_get_data(st->sess, "/test:cont/l2[v < 21]", 0, 0, 0, &data);
+     assert_int_equal(ret, SR_ERR_OK);
++    assert_null(data);
+ 
+-    ret = lyd_print_mem(&str, data->tree, LYD_XML, LYD_PRINT_SIBLINGS);
+-    assert_int_equal(ret, LY_SUCCESS);
+-    sr_release_data(data);
+-    assert_string_equal(str,
+-            "<cont xmlns=\"urn:test\">\n"
+-            "  <l2>\n"
+-            "    <k>k1</k>\n"
+-            "  </l2>\n"
+-            "  <l2>\n"
+-            "    <k>k3</k>\n"
+-            "  </l2>\n"
+-            "</cont>\n");
+-    free(str);
+-
+-    /* read data #1 filtering based on denied leaf */
++    /* read data #2 filtering based on denied leaf */
+     ret = sr_get_data(st->sess, "/test:cont/l2[v > 21]", 0, 0, 0, &data);
+     assert_int_equal(ret, SR_ERR_OK);
+-
+-    ret = lyd_print_mem(&str, data->tree, LYD_XML, LYD_PRINT_SIBLINGS);
+-    assert_int_equal(ret, LY_SUCCESS);
+-    sr_release_data(data);
+-    assert_string_equal(str,
+-            "<cont xmlns=\"urn:test\">\n"
+-            "  <l2>\n"
+-            "    <k>k4</k>\n"
+-            "  </l2>\n"
+-            "</cont>\n");
+-    free(str);
+-
+-    /* read no data */
+-    ret = sr_get_data(st->sess, "/test:cont/l2[v = 22]", 0, 0, 0, &data);
+-    assert_int_equal(ret, SR_ERR_OK);
+     assert_null(data);
+ }
+ 
