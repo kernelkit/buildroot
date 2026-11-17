@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-FIREWALLD_VERSION = 2.3.1
+FIREWALLD_VERSION = 2.3.4
 FIREWALLD_SITE = https://github.com/firewalld/firewalld/releases/download/v$(FIREWALLD_VERSION)
 FIREWALLD_SOURCE = firewalld-$(FIREWALLD_VERSION).tar.bz2
 FIREWALLD_LICENSE = GPL-2.0
