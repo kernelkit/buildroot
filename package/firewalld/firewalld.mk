@@ -4,14 +4,12 @@
 #
 ################################################################################
 
-FIREWALLD_VERSION = 2.3.1
+FIREWALLD_VERSION = 2.3.4
 FIREWALLD_SITE = https://github.com/firewalld/firewalld/releases/download/v$(FIREWALLD_VERSION)
 FIREWALLD_SOURCE = firewalld-$(FIREWALLD_VERSION).tar.bz2
 FIREWALLD_LICENSE = GPL-2.0
 FIREWALLD_LICENSE_FILES = COPYING
 FIREWALLD_CPE_ID_VENDOR = firewalld
-# 0001-fix-policy-use-PK_ACTION_CONFIG-for-set-ZoneSettings.patch
-FIREWALLD_IGNORE_CVES = CVE-2026-4948
 FIREWALLD_AUTORECONF = YES
 
 FIREWALLD_DEPENDENCIES = \
